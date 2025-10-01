@@ -1,0 +1,24 @@
+from spatialmath import SE2, SE3 # to create SE(n) objects
+
+from spatialmath.base import * # for translation & rotation methods
+
+from math import pi # pi constant
+
+import numpy as np # numpy
+
+import roboticstoolbox as rtb # general robotics toolbox module
+
+from roboticstoolbox import DHLink, DHRobot # to create DH Robot
+
+from ir_support import LinearUR3
+
+
+# Create the LinearUR3 robot
+robot = LinearUR3()
+
+
+# Set initial robot position
+home_q = np.array([-0.4, 0, -pi/2, 0, pi/2, 0, 0])
+robot.q = home_q
+
+    
