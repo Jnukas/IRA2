@@ -1,0 +1,57 @@
+# Require libraries
+import numpy as np
+import time
+import swift
+from spatialmath.base import transl
+from roboticstoolbox import models, trapezoidal
+import roboticstoolbox as rtb, pathlib
+
+# Useful variables
+from math import pi
+
+# -----------------------------------------------------------------------------------#
+class Lab4Solution():
+    def __init__(self):
+        print("Lab 4 Solution - UR3 Robot Movement Only")
+
+    def question2_and_3(self):
+        # Load UR3 robot model
+        ur3 = models.UR3()
+
+        # Define two end-effector poses
+        T1 = transl(0.5, -0.4, 0.5)
+        q1 = ur3.ikine_LM(T1, q0=np.zeros([1,6])).q
+
+        T2 = transl(0.5, 0.4, 0.1)
+        q2 = ur3.ikine_LM(T2, q0=q1).q
+
+        # Generate a trapezoidal joint trajectory
+        steps = 50
+        s = trapezoidal(0, 1, steps).q
+        q_matrix = np.empty((steps, 6))
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q1 + s[i] * q2
+
+        # Launch Swift environment and add robot
+        env = swift.Swift()
+        env.launch(realtime=True)
+        env.set_camera_pose([1.25, 1.25, 1.25], [0, 0, 0])
+        env.add(ur3, readonly=False)
+
+        # Animate the robot through the trajectory
+        for q in q_matrix:
+            ur3.q = q
+            env.step(0.05)
+
+        input("Press enter to exit.\n")
+        pathlib.Path("ur3_loaded.urdf").write_text(ur3.urdf_string)
+        print("Wrote:", "ur3_loaded.urdf")
+        env.close()
+
+# ---------------------------------------------------------------------------------------#
+# Main block
+if __name__ == "__main__":
+    soln = Lab4Solution()
+    soln.question2_and_3()
+    print("UR3 motion completed.")
+    time.sleep(0.5)

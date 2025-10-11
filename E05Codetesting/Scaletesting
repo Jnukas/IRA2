@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+"""
+Displays your custom E05 robot (from URDF)
+in the Swift 3D environment with a short animation.
+"""
+
+from __future__ import annotations
+import time
+import numpy as np
+from math import pi
+from pathlib import Path
+
+import swift
+from spatialmath import SE3
+from roboticstoolbox import jtraj
+from roboticstoolbox.robot.Robot import Robot
+
+
+# ---------------------------------------------------------------------
+# Path to your absolute URDF version of E05
+# ---------------------------------------------------------------------
+E05_URDF = Path(__file__).resolve().parent / "E05_robot_ABS.urdf"
+
+
+# ---------------------------------------------------------------------
+# Custom class for loading your E05 robot
+# ---------------------------------------------------------------------
+class E05ABS(Robot):
+    def __init__(self, path: Path):
+        if not path.exists():
+            raise FileNotFoundError(f"URDF not found: {path}")
+        links, name, urdf_string, urdf_filepath = self.URDF_read(str(path))
+        super().__init__(links, name=name or "E05", urdf_string=urdf_string, urdf_filepath=str(path))
+        # Named configurations
+        self.qz = np.zeros(self.n)
+        self.qr = np.array([0, pi / 2, 0, 0, 0, 0])[: self.n]
+        self.addconfiguration("qz", self.qz)
+        self.addconfiguration("qr", self.qr)
+        print(f"[E05] Loaded from: {self.urdf_filepath}")
+
+
+# ---------------------------------------------------------------------
+# Main display and animation logic
+# ---------------------------------------------------------------------
+def main():
+    # === Launch Swift environment ===
+    env = swift.Swift()
+    env.launch(realtime=True, browser="windows-default")
+    env.set_camera_pose([1.5, 1.5, 1.1], [0, 0, 0])
+
+    # === Load and show the E05 robot ===
+    e05 = E05ABS(E05_URDF)
+    e05.base = SE3(0, 0, 0.05)  # small lift above ground
+    env.add(e05, readonly=False)
+    print("[Scene] E05 robot added to Swift environment.")
+
+    # Let the scene load
+    for _ in range(30):
+        env.step(0.03)
+        time.sleep(0.03)
+
+    input("\n⏸ Press Enter to start the robot motion...")
+
+    # === Animate E05 ===
+    print("[Animation] Moving E05 from qz → qr ...")
+    traj_e05 = jtraj(e05.qz, e05.qr, 60).q
+
+    for q in traj_e05:
+        e05.q = q
+        env.step(0.03)
+
+    input("✅ Done. Press Enter to close...")
+    env.close()
+
+
+if __name__ == "__main__":
+    main()

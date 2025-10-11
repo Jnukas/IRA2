@@ -1,0 +1,32 @@
+# patch_e05_mesh_paths.py
+from pathlib import Path
+import re
+
+MODEL = Path("E05_robot.urdf")  # or "E05_robot.urdf.xacro"
+raw = MODEL.read_text(encoding="utf-8")
+
+def normalize(m):
+    quote, path = m.group(1), m.group(2)
+    p = path.replace("\\", "/")
+    # If it contains /meshes/, keep the tail after it
+    if "meshes/" in p:
+        p = "meshes/" + p.split("meshes/", 1)[1]
+    else:
+        # strip obvious prefixes (package://..., drive roots, site-packages, etc.)
+        bad_prefixes = [
+            "package://", "file://", "http://", "https://",
+            "/usr/", "/opt/", "/home/", "/Library/", "/Applications/",
+            "C:/", "D:/", "E:/"
+        ]
+        for b in bad_prefixes:
+            if p.startswith(b):
+                p = p.split("/")[-1]  # last component
+                break
+        if not p.startswith("meshes/"):
+            p = "meshes/" + p
+    return f'filename={quote}{p}{quote}'
+
+patched = re.sub(r'filename=(["\'])([^"\']+)\1', normalize, raw, flags=re.IGNORECASE)
+MODEL.with_suffix(MODEL.suffix + ".bak").write_text(raw, encoding="utf-8")
+MODEL.write_text(patched, encoding="utf-8")
+print(f"Updated {MODEL} (backup saved).")
