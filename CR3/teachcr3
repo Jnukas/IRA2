@@ -1,0 +1,117 @@
+# === CR3 + Swift Teach Mode (real-time update) ===
+from Cr3UR3editon import CR3            # your robot class
+import swift
+import numpy as np
+import time
+import os
+from spatialmath.base import tr2rpy     # for RPY readout
+
+# ---------------- Teach Mode ----------------
+def teach_mode(robot, env):
+    """
+    Adds sliders (deg) for each joint and live labels for XYZ + RPY.
+    Call once after adding the robot to the Swift env.
+    """
+
+    # live pose -> strings
+    def pose_strings():
+        T = robot.fkine(robot.q).A if hasattr(robot.fkine(robot.q), "A") else robot.fkine(robot.q)
+        xyz = np.round(T[0:3, 3], 3)
+        rpy = np.round(tr2rpy(T, unit="deg"), 2)
+        return (
+            f"X: {xyz[0]} m", f"Y: {xyz[1]} m", f"Z: {xyz[2]} m",
+            f"Roll (φ): {rpy[0]}°", f"Pitch (θ): {rpy[1]}°", f"Yaw (ψ): {rpy[2]}°"
+        )
+
+    # initial labels
+    xs, ys, zs, rs, ps, ys2 = pose_strings()
+    label_x = swift.Label(xs);   env.add(label_x)
+    label_y = swift.Label(ys);   env.add(label_y)
+    label_z = swift.Label(zs);   env.add(label_z)
+    label_r = swift.Label(rs);   env.add(label_r)
+    label_p = swift.Label(ps);   env.add(label_p)
+    label_yaw = swift.Label(ys2); env.add(label_yaw)
+    labels = [label_x, label_y, label_z, label_r, label_p, label_yaw]
+
+    # slider callback (per joint)
+    def on_slider(value_deg, jindex):
+        q = list(robot.q)
+        q[jindex] = np.deg2rad(value_deg)
+
+        # clamp to limits if available
+        try:
+            qmin, qmax = robot.links[jindex].qlim
+            q[jindex] = float(np.clip(q[jindex], qmin, qmax))
+        except Exception:
+            pass
+
+        robot.q = q
+
+        # update pose labels
+        xs, ys, zs, rs, ps, ys2 = pose_strings()
+        labels[0].desc = xs
+        labels[1].desc = ys
+        labels[2].desc = zs
+        labels[3].desc = rs
+        labels[4].desc = ps
+        labels[5].desc = ys2
+        # no need to step here if main loop is stepping
+
+    # create one slider per joint
+    for j in range(robot.n):
+        # limits in degrees (fallback to ±180°)
+        try:
+            qmin, qmax = robot.links[j].qlim
+            mn_deg, mx_deg = float(np.rad2deg(qmin)), float(np.rad2deg(qmax))
+        except Exception:
+            mn_deg, mx_deg = -180.0, 180.0
+
+        val_deg = float(np.rad2deg(robot.q[j]))
+        val_deg = float(np.clip(val_deg, mn_deg, mx_deg))
+
+        # capture j by value using default arg (jj=j)
+        slider = swift.Slider(
+            cb=lambda v, jj=j: on_slider(v, jj),
+            min=mn_deg, max=mx_deg, step=1.0,
+            value=val_deg,
+            desc=f"Joint {j+1}", unit='°'
+        )
+        env.add(slider)
+
+    env.step(0.02)
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    # Launch Swift
+    env = swift.Swift()
+    env.launch(realtime=True)
+
+    # Build & add robot
+    robot = CR3()
+    robot.add_to_env(env)
+
+    # Mesh path debug (from your snippet)
+    print("Mesh dir:", robot._link3D_dir)
+    for k, name in robot.link3D_names.items():
+        path = os.path.join(robot._link3D_dir, name + ".dae")
+        try:
+            size = os.path.getsize(path)
+            print(k, os.path.basename(path), "size:", size)
+        except OSError:
+            print(k, os.path.basename(path), "MISSING")
+
+    # Enable teach mode UI
+    teach_mode(robot, env)
+
+    # --- REAL-TIME UPDATE LOOP ---
+    # Keep stepping the environment so slider events are processed
+    try:
+        while True:
+            env.step(0.02)     # ~50 Hz update
+            # time.sleep(0.02) # optional small sleep; env.step already advances frames
+    except KeyboardInterrupt:
+        print("\nClosing Swift environment...")
+        env.close()
+
+    # Alternative: replace loop with this single call (blocks & updates until window closed)
+    # env.hold()

@@ -1,0 +1,30 @@
+from ir_support.robots import UR3
+import swift
+from roboticstoolbox import Robot
+from pathlib import Path
+import numpy as np
+import time
+from Cr3UR3editon import CR3
+
+# Launch Swift environment
+env = swift.Swift()
+env.launch(realtime=True)
+
+# Add your robot
+CR3 = CR3()
+CR3.add_to_env(env)
+# ur3.test()
+
+import os
+print("Mesh dir:", CR3._link3D_dir)        # should be the folder with your edited meshes
+for k, name in CR3.link3D_names.items():
+    # Adjust extension if yours are .obj/.ply
+    path = os.path.join(CR3._link3D_dir, name + ".dae")
+    print(k, os.path.basename(path), "size:", os.path.getsize(path))
+# Keep Swift open permanently
+try:
+    while True:
+        time.sleep(1)  # keeps CPU usage low
+except KeyboardInterrupt:
+    print("\nClosing Swift environment...")
+    env.close()
