@@ -62,12 +62,13 @@ oven.T = SE3(0.0, -ROOM_D / 2 + 0.60, FLOOR_TOP + z_lift) @ SE3.Rz(math.pi)
 env.add(oven)
 
 # -------------------------
+# -------------------------
 # Table (STL)
 # -------------------------
 table_path = Path(__file__).parent / "assets" / "table.stl"
 
-TABLE_SCALE = [1, 1, 1]  # use [0.001]*3 if exported in millimetres
-SCALE_MM = 1.0           # set 0.001 if table STL is in mm
+TABLE_SCALE = [1, 1, 1]   # use [0.001]*3 if STL is in mm
+SCALE_MM = 1.0            # set 0.001 if STL is in mm
 
 table = sg.Mesh(
     filename=str(table_path),
@@ -84,11 +85,19 @@ try:
     size_tbl_m = (tm_tbl.bounds[1] - tm_tbl.bounds[0]) * SCALE_MM
     print(f"Table size (m): X={size_tbl_m[0]:.3f}  Y={size_tbl_m[1]:.3f}  Z={size_tbl_m[2]:.3f}")
 except Exception:
+    size_tbl_m = None
     pass
+
+# >>> ADD THIS: world Z of the tabletop
+try:
+    table_top_z = FLOOR_TOP + z_lift_table + float(size_tbl_m[2])
+except Exception:
+    table_top_z = FLOOR_TOP + z_lift_table + 0.75  # fallback if bounds unknown
 
 # Place: left side of room, rotated 90° about Z
 table.T = SE3(-1.5, -0.5, FLOOR_TOP + z_lift_table) @ SE3.Rz(math.pi / 2)
 env.add(table)
+
 
 # --- Linear UR3 (with prismatic rail as joint 0) ---
 ur3 = LinearUR3()              # uses the .dae/.stl files in the same folder as the class
@@ -105,6 +114,92 @@ ur3.base = SE3(RAIL_X0, RAIL_Y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
 
 # Add to Swift
 ur3.add_to_env(env)
+
+# Add CR3 (from Cr3UR3editon.py in this same folder)
+# -------------------------
+import importlib.util, types, inspect
+from pathlib import Path as _Path
+
+CR3_FILE = _Path(__file__).parent / "Cr3UR3editon.py"
+
+def _load_robot_class_from_file(pyfile: _Path):
+    if not pyfile.exists():
+        raise FileNotFoundError(f"CR3 file not found: {pyfile}")
+
+    spec = importlib.util.spec_from_file_location("cr3_custom_module", str(pyfile))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)  # module.__file__ is set correctly
+
+    # 1) Try common names first
+    for name in ("CR3", "Cr3UR3editon", "DobotCR3", "RobotCR3"):
+        if hasattr(mod, name) and inspect.isclass(getattr(mod, name)):
+            return getattr(mod, name)
+
+    # 2) Otherwise pick any RTB robot subclass (prefer names containing 'CR3')
+    candidates = []
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj):
+            try:
+                if issubclass(obj, (rtb.ERobot, rtb.DHRobot, rtb.Robot)):  # type: ignore
+                    candidates.append((name, obj))
+            except Exception:
+                pass
+
+    if candidates:
+        for name, cls in candidates:
+            if "CR3" in name.upper():
+                print(f"[CR3 loader] Using {name} from {pyfile.name}")
+                return cls
+        name, cls = candidates[0]
+        print(f"[CR3 loader] Using {name} from {pyfile.name}")
+        return cls
+
+    raise ImportError(f"No robot class found in {pyfile.name}. "
+                      f"Export a class like `class CR3(DHRobot/ERobot): ...`.")
+
+# Load, place, and add CR3
+CR3Class = _load_robot_class_from_file(CR3_FILE)
+cr3 = CR3Class()
+
+# Base pose — right side of room, facing the table
+CR3_X, CR3_Y = -1.2, 0.45
+CR3_Z        = 0.945 + 0.003           # or use table_top_z + 0.003 if mounting on table
+CR3_YAW      = -math.pi / 2
+
+base0 = getattr(cr3, "base", SE3())
+cr3.base = SE3(CR3_X, CR3_Y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0
+
+# Spawn pose BEFORE adding to env (prevents flicker/teleport)
+try:
+    q_spawn = cr3.q.copy()
+except Exception:
+    q_spawn = np.zeros(getattr(cr3, "n", 6))
+cr3.q = q_spawn
+if hasattr(cr3, "qtest"):
+    cr3.qtest = q_spawn
+
+# Add to Swift
+if hasattr(cr3, "add_to_env"):
+    cr3.add_to_env(env)
+else:
+    env.add(cr3)
+env.step(0.02)
+
+# (Optional) quick wiggle to confirm it's alive
+try:
+    T, dt = 2.0, 1/60
+    t = np.arange(0, T+dt, dt)
+    qs = cr3.q.copy(); qg = cr3.q.copy()
+    j = min(2, qs.size-1)            # wiggle joint 2 (or last valid)
+    qg[j] += np.deg2rad(15)
+    traj = rtb.jtraj(qs, qg, t)
+    for qk in traj.q:
+        cr3.q = qk
+        env.step(dt)
+        time.sleep(dt)
+except Exception as _e:
+    print("[CR3] Wiggle skipped:", _e)
 
 # Comfortable starting posture (the class sets qtest; you can keep it or change it)
 # Example: keep the rail at -0.4 m and leave arm joints as they are
@@ -128,6 +223,8 @@ for qk in traj.q:
     time.sleep(dt)
 
 # -------------------------
+# -------------------------
+
 
 # -------------------------
 
