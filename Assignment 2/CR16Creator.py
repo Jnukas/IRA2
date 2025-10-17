@@ -63,9 +63,16 @@ class CR16(DHRobot3D):
         Create robot's standard DH model
         """
         a = [0,      -0.512, -0.363, 0,       0, 0]
-        d = [0.1785, 0,         0,       0.191, 0.125, 0.1084]
+        d = [0.1765, 0,         0,       0.191, 0.125, 0.1084]
         alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
-        qlim = [[-2*pi, 2*pi] for _ in range(6)]
+        qlim = [
+    [-2*pi,  2*pi],            # J1  ±360°
+    [-2*pi,  2*pi],            # J2  ±360°
+    [-160*pi/180, 160*pi/180], # J3  ±160°
+    [-2*pi,  2*pi],            # J4  ±360°
+    [-2*pi,  2*pi],            # J5  ±360°
+    [-2*pi,  2*pi],            # J6  ±360°
+        ]
         links = []
         for i in range(6):
             link = rtb.RevoluteDH(d=d[i], a=a[i], alpha=alpha[i], qlim= qlim[i])
