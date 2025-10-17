@@ -40,13 +40,13 @@ class CR3(DHRobot3D):
         links = self._create_DH()
 
         # Names of the robot link files in the directory
-        link3D_names = dict(link0 = 'CR3_first',
-                            link1 = 'CR3_second',
-                            link2 = 'CR3_third',
-                            link3 = 'CR3_fourth',
-                            link4 = 'CR3_fifth',
-                            link5 = 'CR3_sixith',
-                            link6 = 'CR3_seventh')
+        link3D_names = dict(link0 = 'CR3smaller_1',
+                            link1 = 'CR3smaller_2',
+                            link2 = 'CR3smaller_3',
+                            link3 = 'CR3smaller_4',
+                            link4 = 'CR3smaller_5',
+                            link5 = 'CR3smaller_6',
+                            link6 = 'CR3smaller_7')
 
         # A joint config and the 3D object transforms to match that config
         qtest = [0,-pi/2,0,0,0,0]
@@ -62,8 +62,8 @@ class CR3(DHRobot3D):
         """
         Create robot's standard DH model
         """
-        a = [0,      -2.74, -2.30, 0,       0, 0]
-        d = [1.348, 0,         0,       1.16, 1.16, 1.05]
+        a = [0,      -0.274, -0.230, 0,       0, 0]
+        d = [0.1348, 0,         0,       0.116, 0.116, 0.105]
         alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
         qlim = [[-2*pi, 2*pi] for _ in range(6)]
         links = []
