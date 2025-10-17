@@ -201,6 +201,123 @@ try:
 except Exception as _e:
     print("[CR3] Wiggle skipped:", _e)
 
+# -------------------------
+# Add CR16 (from CR16.py in this same folder)
+# -------------------------
+import importlib.util, inspect
+from pathlib import Path as _Path
+
+CR16_FILE = _Path(__file__).parent / "CR16Creator.py"   # <-- change if your filename differs
+
+def _load_robot16_class_from_file(pyfile: _Path):
+    if not pyfile.exists():
+        raise FileNotFoundError(f"CR16 file not found: {pyfile}")
+
+    spec = importlib.util.spec_from_file_location("cr16_custom_module", str(pyfile))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    # 1) Try common names first
+    for name in ("CR16", "DobotCR16", "RobotCR16", "Cr16", "Cr16UR3Edition"):
+        if hasattr(mod, name) and inspect.isclass(getattr(mod, name)):
+            return getattr(mod, name)
+
+    # 2) Otherwise pick any RTB robot subclass (prefer names containing 'CR16')
+    candidates = []
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj):
+            try:
+                if issubclass(obj, (rtb.ERobot, rtb.DHRobot, getattr(rtb, "Robot", tuple()))):
+                    candidates.append((name, obj))
+            except Exception:
+                pass
+
+    if candidates:
+        for name, cls in candidates:
+            if "CR16" in name.upper():
+                print(f"[CR16 loader] Using {name} from {pyfile.name}")
+                return cls
+        name, cls = candidates[0]
+        print(f"[CR16 loader] Using {name} from {pyfile.name}")
+        return cls
+
+    raise ImportError(
+        f"No robot class found in {pyfile.name}. "
+        f"Export a class like `class CR16(DHRobot/ERobot): ...`."
+    )
+
+# Load & instantiate (robust to different __init__ signatures)
+CR16Class = _load_robot16_class_from_file(CR16_FILE)
+try:
+    cr16 = CR16Class()                 # most classes
+except TypeError:
+    try:
+        cr16 = CR16Class(use_mesh=False)  # if your class supports a mesh toggle
+    except Exception as e:
+        print("[CR16] Failed to instantiate:", e)
+        cr16 = None
+
+if cr16 is not None:
+    # --- Placement ---
+    # Mount on the table (default). To floor-mount, set CR16_ON_TABLE=False.
+    CR16_ON_TABLE = True
+    if CR16_ON_TABLE:
+        CR16_Z = float(table_top_z) + 0.003
+    else:
+        CR16_Z = FLOOR_TOP + 0.003
+
+    # Choose a pose that won’t collide with CR3:
+    # (table is at approx X=-1.5, Y=-0.5; adjust if you want)
+    CR16_X, CR16_Y = -1.2, -1
+    CR16_Z = 0.945 + 0.003
+    CR16_YAW = +math.pi / 2   # face +X; try 0, ±pi/2, pi to rotate
+
+    base0 = getattr(cr16, "base", SE3())
+    cr16.base = SE3(CR16_X, CR16_Y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0
+
+    # Spawn joints BEFORE adding to env (avoid flicker)
+    try:
+        if hasattr(cr16, "q_home"):
+            q_spawn = cr16.q_home
+        elif hasattr(cr16, "qtest"):
+            q_spawn = cr16.qtest
+        else:
+            q_spawn = cr16.q.copy()
+    except Exception:
+        q_spawn = np.zeros(getattr(cr16, "n", 6))
+    cr16.q = q_spawn
+
+    # --- Add to Swift ---
+    try:
+        if hasattr(cr16, "add_to_env"):
+            cr16.add_to_env(env)  # DHRobot3D/ERobot path
+        else:
+            # Cylinder stick fallback for plain DHRobot classes
+            try:
+                from ir_support import CylindricalDHRobotPlot
+                CylindricalDHRobotPlot(cr16).add_to_env(env)
+            except Exception:
+                env.add(cr16)  # last resort (may be no-op for DHRobot)
+        env.step(0.02)
+    except Exception as e:
+        print("[CR16] Visual add failed:", e)
+
+    # --- Optional: quick wiggle to confirm it's alive ---
+    try:
+        T, dt = 2.0, 1/60
+        t = np.arange(0, T+dt, dt)
+        qs = cr16.q.copy(); qg = cr16.q.copy()
+        j = min(2, qs.size - 1)   # wiggle joint 2 or last valid
+        qg[j] += np.deg2rad(12)
+        traj = rtb.jtraj(qs, qg, t)
+        for qk in traj.q:
+            cr16.q = qk
+            env.step(dt)
+            time.sleep(dt)
+    except Exception as _e:
+        print("[CR16] Wiggle skipped:", _e)
+# -------------------------
 # Comfortable starting posture (the class sets qtest; you can keep it or change it)
 # Example: keep the rail at -0.4 m and leave arm joints as they are
 q = ur3.q.copy()
