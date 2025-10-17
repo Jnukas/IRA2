@@ -8,7 +8,6 @@ from room_utils import apply_swift_browser_fix, make_room
 import roboticstoolbox as rtb
 import numpy as np
 import time
-
 from ir_support.robots.LinearUR3 import LinearUR3
 
 # -------------------------
@@ -88,9 +87,7 @@ except Exception:
     pass
 
 # Place: left side of room, rotated 90° about Z
-table.T = SE3(-1.5, -
-              
-              0.5, FLOOR_TOP + z_lift_table) @ SE3.Rz(math.pi / 2)
+table.T = SE3(-1.5, -0.5, FLOOR_TOP + z_lift_table) @ SE3.Rz(math.pi / 2)
 env.add(table)
 
 # --- Linear UR3 (with prismatic rail as joint 0) ---
@@ -100,7 +97,7 @@ ur3 = LinearUR3()              # uses the .dae/.stl files in the same folder as 
 # PICK THE SPOT (edit these numbers)
 RAIL_X0 = 0.4         # left/right  (more + = right, more − = left)
 RAIL_Y  = -1            # front/back  (increase to move toward the camera)
-RAIL_Z  = FLOOR_TOP         # height (usually the floor)
+RAIL_Z  = FLOOR_TOP + 0.003      # height (usually the floor)
 YAW     = math.pi/90        # 0, ±pi/2, or pi — try pi/2 to face the table
 
 # Place the whole rail/robot in the room
@@ -112,16 +109,27 @@ ur3.add_to_env(env)
 # Comfortable starting posture (the class sets qtest; you can keep it or change it)
 # Example: keep the rail at -0.4 m and leave arm joints as they are
 q = ur3.q.copy()
-q[0] = -0.4                    # prismatic rail joint (limits in the class: [-0.8, 0])
+q[0] = 0                    # prismatic rail joint (limits in the class: [-0.8, 0])
 ur3.q = q
 env.step(0.02)
 
 # (Optional) quick demo: slide the rail
-# q_start = ur3.q.copy()
-# q_goal  = q_start.copy(); q_goal[0] = -0.8     # full travel toward negative X
-# for q in rtb.jtraj(q_start, q_goal, 60).q:
-#      ur3.q = q
-# env.step(0.02); time.sleep(0.02)
+q_start = ur3.q.copy()
+q_goal  = q_start.copy(); q_goal[0] = -0.8     # full travel toward negative X
+T  = 3.0                 # seconds of motion
+dt = 1.0 / 60.0          # 60 FPS
+t  = np.arange(0, T+dt, dt)
+
+traj = rtb.jtraj(q_start, q_goal, t)  # LSPB profile with zero vel at ends
+
+for qk in traj.q:
+    ur3.q = qk
+    env.step(dt)          # <-- step INSIDE the loop
+    time.sleep(dt)
+
+# -------------------------
+
+# -------------------------
 
 # -------------------------
 # Camera + hold
