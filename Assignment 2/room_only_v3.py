@@ -165,8 +165,33 @@ def main():
     Potwithoutthelid.T = SE3(-2, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0) #manual positioning of the pot
     env.add(Potwithoutthelid)
 
+    # WORK_TABLE_BS(STL) — placements unchanged
     # -------------------------
-    # Linear UR3 — placements unchanged
+    WORK_TABLE_BS_path = Path(__file__).parent / "assets" / "WORK_TABLE_BS.stl"
+    WORK_TABLE_BS = sg.Mesh(
+        filename=str(WORK_TABLE_BS_path),
+        scale=[0.001, 0.001, 0.001],  # keep as-is
+        color=[0.70, 0.70, 0.70, 1.0],
+    )
+
+    # Auto-lift so base sits on slab (assumes STL in mm)
+    z_lift = 0.0
+    try:
+        import trimesh
+        tm = trimesh.load_mesh(str(WORK_TABLE_BS), process=False)
+        zmin = float(tm.bounds[0, 2])
+        z_lift = -zmin * 0.001
+        size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
+        print(f"Pot size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+    except Exception:
+        pass
+
+    #manual positioning of the table
+    WORK_TABLE_BS.T = SE3(0, 0, 0) @ SE3.Rz(0) #manual positioning of the pot
+    env.add(WORK_TABLE_BS)
+
+    #-------------------------
+    #Linear UR3 — placements unchanged
     # -------------------------
     ur3 = LinearUR3()  # uses class assets
     RAIL_X0 = 0.4
