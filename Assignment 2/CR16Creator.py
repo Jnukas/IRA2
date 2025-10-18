@@ -1,8 +1,3 @@
-##  @file
-#   @brief UR3 Robot defined by standard DH parameters with 3D model
-#   @author Ho Minh Quang Ngo
-#   @date Jul 20, 2023
-
 import swift
 import roboticstoolbox as rtb
 import spatialmath.base as spb
@@ -66,13 +61,13 @@ class CR16(DHRobot3D):
         d = [0.1765, 0,         0,       0.191, 0.125, 0.1084]
         alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
         qlim = [
-    [-2*pi,  2*pi],            # J1  ±360°
-    [-2*pi,  2*pi],            # J2  ±360°
-    [-160*pi/180, 160*pi/180], # J3  ±160°
-    [-2*pi,  2*pi],            # J4  ±360°
-    [-2*pi,  2*pi],            # J5  ±360°
-    [-2*pi,  2*pi],            # J6  ±360°
-        ]
+            [-2*pi,  2*pi],            # J1  ±360°
+            [-2*pi,  2*pi],            # J2  ±360°
+            [-160*pi/180, 160*pi/180], # J3  ±160°
+            [-2*pi,  2*pi],            # J4  ±360°
+            [-2*pi,  2*pi],            # J5  ±360°
+            [-2*pi,  2*pi],            # J6  ±360°
+                ]
         links = []
         for i in range(6):
             link = rtb.RevoluteDH(d=d[i], a=a[i], alpha=alpha[i], qlim= qlim[i])
