@@ -119,7 +119,7 @@ def main():
     table = sg.Mesh(
         filename=str(table_path),
         scale=TABLE_SCALE,
-        color=[0.82, 0.82, 0.82, 1.0],
+        color=[0.50, 0.50, 0.50, 1.0],
     )
 
     z_lift_table = 0.0
@@ -147,7 +147,7 @@ def main():
     Potwithoutthelid = sg.Mesh(
         filename=str(Potwithoutthelid_path),
         scale=[0.002, 0.002, 0.002],  # keep as-is
-        color=[0.70, 0.70, 0.70, 1.0],
+        color=[1, 0, 0, 1.0],
     )
 
     # Auto-lift so base sits on slab (assumes STL in mm)
@@ -162,33 +162,36 @@ def main():
     except Exception:
         pass
 
-    Potwithoutthelid.T = SE3(-2, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0) #manual positioning of the pot
+    Potwithoutthelid.T = SE3(-1.75, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0) #manual positioning of the pot
     env.add(Potwithoutthelid)
 
     # WORK_TABLE_BS(STL) — placements unchanged
     # -------------------------
-    WORK_TABLE_BS_path = Path(__file__).parent / "assets" / "rightwayup.stl"
-    WORK_TABLE_BS = sg.Mesh(
-        filename=str(WORK_TABLE_BS_path),
-        scale=[0.001, 0.001, 0.001],  # keep as-is
-        color=[0.70, 0.70, 0.70, 1.0],
+    WORK_TABLE_BS2_path = Path(__file__).parent / "assets" / "rightwayup.stl"
+    WORK_TABLE_BS2 = sg.Mesh(
+        filename=str(WORK_TABLE_BS2_path),
+        scale=[0.001, 0.001, 0.001],   # mm -> m
+        color=[0.50, 0.50, 0.50, 1.0],
     )
 
-    # Auto-lift so base sits on slab (assumes STL in mm)
+    # --- Auto-lift so the lowest vertex sits on z=0 (assuming STL in mm)
     z_lift = 0.0
     try:
         import trimesh
-        tm = trimesh.load_mesh(str(WORK_TABLE_BS), process=False)
+        tm = trimesh.load_mesh(str(WORK_TABLE_BS2_path), process=False)  # <-- use the PATH, not the Mesh
         zmin = float(tm.bounds[0, 2])
-        z_lift = -zmin * 0.001
+        z_lift = -zmin * 0.001  # mm -> m
         size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
-        print(f"Pot size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+        print(f"Table size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
     except Exception:
         pass
 
-    #manual positioning of the table
-    WORK_TABLE_BS.T = SE3(0, 0, 0) @ SE3.Rz(0) #manual positioning of the pot
-    env.add(WORK_TABLE_BS)
+    # --- Absolute placement (world frame)
+    # Example: put the table at x=0.80, y=0.30, sitting on the floor, yaw=90°
+    floor_top = 0.0  # set to your room floor top (e.g., 0.005) if you use one
+
+    WORK_TABLE_BS2.T = SE3(1.50, 0, z_lift + floor_top) @ SE3.RPY([-90, 0, 0], order='xyz', unit='deg')
+    env.add(WORK_TABLE_BS2)
 
     #-------------------------
     #Linear UR3 — placements unchanged
