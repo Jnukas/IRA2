@@ -19,13 +19,14 @@ from ir_support.robots.LinearUR3 import LinearUR3
 
 
 # ===== Motion toggles (no placement changes) =====
-RUN_WIGGLE_CR3  = True
-RUN_WIGGLE_CR16 = True
-RUN_RAIL_SLIDE  = True
+RUN_WIGGLE_CR3  = False
+RUN_WIGGLE_CR16 = False
+RUN_RAIL_SLIDE  = False
 FPS = 60
 DT = 1.0 / FPS
 
 
+# --- helpers for dynamic loading ---
 def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
     """Dynamic loader that returns the first matching RTB robot class."""
     if not pyfile.exists():
@@ -43,7 +44,7 @@ def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
 
     # 2) else scan for any RTB robot subclass
     candidates = []
-    RobotBase = getattr(rtb, "Robot", tuple())  # RTB may not export 'Robot'
+    RobotBase = getattr(rtb, "Robot", tuple())
     for name, obj in vars(mod).items():
         if inspect.isclass(obj):
             try:
@@ -60,6 +61,47 @@ def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
                       f"Export a class like `class MyBot(DHRobot/ERobot): ...`.")
 
 
+# --- helpers ---
+def _T_translation(T_like):
+    """Return (x,y,z) from an SE3 or a 4x4 ndarray."""
+    try:
+        t = T_like.t  # SE3
+        return float(t[0]), float(t[1]), float(t[2])
+    except Exception:
+        M = np.asarray(T_like)
+        return float(M[0, 3]), float(M[1, 3]), float(M[2, 3])
+
+
+def solve_ik_relaxed(robot, T: SE3, qseed=None):
+    """
+    IK with fallbacks: full 6D → relax yaw → position-only.
+    Returns (q, success: bool).
+    """
+    if qseed is None:
+        qseed = getattr(robot, "q", np.zeros(robot.n))
+    sol = robot.ikine_LM(T, q0=qseed)
+    if sol.success:
+        return sol.q, True
+    sol = robot.ikine_LM(T, q0=qseed, mask=[1, 1, 1, 1, 1, 0])
+    if sol.success:
+        return sol.q, True
+    sol = robot.ikine_LM(T, q0=qseed, mask=[1, 1, 1, 0, 0, 0])
+    return sol.q, sol.success
+
+
+def animate_jtraj(robot, env, q_start, q_goal, seconds, dt=DT):
+    """
+    Joint-space move using jtraj (LSPB profile by default).
+    """
+    t = np.arange(0.0, max(seconds, dt) + dt, dt)
+    traj = rtb.jtraj(np.array(q_start), np.array(q_goal), t)
+    for qk in traj.q:
+        robot.q = qk
+        env.step(dt)
+        time.sleep(dt)
+    return traj.q[-1]  # final joint vector
+
+
 def main():
     # -------------------------
     # Launch Swift
@@ -69,32 +111,30 @@ def main():
     env.launch(realtime=True, browser=None, host="127.0.0.1", port=52100, ws_port=53100)
 
     # -------------------------
-    # Room (constants + build)
+    # Room
     # -------------------------
     ROOM_W = 6.0
     ROOM_D = 6.0
-    FLOOR_TOP = 0.005  # keep floor a few mm above z=0 to avoid z-fighting
+    FLOOR_TOP = 0.005
 
     make_room(
         env,
         room_w=ROOM_W,
         room_d=ROOM_D,
-        floor_t=0.10,      # 10 cm slab
+        floor_t=0.10,
         open_side="+Y",
         floor_top=FLOOR_TOP,
     )
 
     # -------------------------
-    # Oven (STL) — placements unchanged
+    # Oven (STL)
     # -------------------------
     oven_path = Path(__file__).parent / "assets" / "oven2.stl"
     oven = sg.Mesh(
         filename=str(oven_path),
-        scale=[0.05, 0.05, 0.05],  # keep as-is
+        scale=[0.05, 0.05, 0.05],
         color=[0.70, 0.70, 0.70, 1.0],
     )
-
-    # Auto-lift so base sits on slab (assumes STL in mm)
     z_lift = 0.0
     try:
         import trimesh
@@ -105,117 +145,98 @@ def main():
         print(f"Oven size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
     except Exception:
         pass
-
     oven.T = SE3(0.0, -ROOM_D / 2 + 0.60, FLOOR_TOP + z_lift) @ SE3.Rz(math.pi)
     env.add(oven)
 
     # -------------------------
-    # Table (STL) — placements unchanged
+    # Table (STL)
     # -------------------------
     table_path = Path(__file__).parent / "assets" / "table.stl"
-    TABLE_SCALE = [1, 1, 1]   # keep as-is (use [0.001]*3 if your STL is mm)
-    SCALE_MM = 1.0            # keep as-is (set 0.001 if STL is mm)
-
     table = sg.Mesh(
         filename=str(table_path),
-        scale=TABLE_SCALE,
+        scale=[1, 1, 1],
         color=[0.82, 0.82, 0.82, 1.0],
     )
-
     z_lift_table = 0.0
     try:
         import trimesh
         tm_tbl = trimesh.load_mesh(str(table_path), process=False)
         zmin_tbl = float(tm_tbl.bounds[0, 2])
-        z_lift_table = -zmin_tbl * SCALE_MM
-        size_tbl_m = (tm_tbl.bounds[1] - tm_tbl.bounds[0]) * SCALE_MM
+        z_lift_table = -zmin_tbl * 1.0
+        size_tbl_m = (tm_tbl.bounds[1] - tm_tbl.bounds[0]) * 1.0
         print(f"Table size (m): X={size_tbl_m[0]:.3f}  Y={size_tbl_m[1]:.3f}  Z={size_tbl_m[2]:.3f}")
     except Exception:
         size_tbl_m = None
-
     try:
         table_top_z = FLOOR_TOP + z_lift_table + float(size_tbl_m[2])  # noqa: F823
     except Exception:
-        table_top_z = FLOOR_TOP + z_lift_table + 0.75  # fallback if bounds unknown
-
+        table_top_z = FLOOR_TOP + z_lift_table + 0.75
     table.T = SE3(-1.5, -0.5, FLOOR_TOP + z_lift_table) @ SE3.Rz(math.pi / 2)
     env.add(table)
 
-    # Potwithoutthelid(STL) — placements unchanged
     # -------------------------
-    Potwithoutthelid_path = Path(__file__).parent / "assets" / "Potwithoutthelid.stl"
-    Potwithoutthelid = sg.Mesh(
-        filename=str(Potwithoutthelid_path),
-        scale=[0.002, 0.002, 0.002],  # keep as-is
+    # Pot (STL)
+    # -------------------------
+    pot_path = Path(__file__).parent / "assets" / "Potwithoutthelid.stl"
+    pot = sg.Mesh(
+        filename=str(pot_path),
+        scale=[0.002, 0.002, 0.002],
         color=[0.70, 0.70, 0.70, 1.0],
     )
-
-    # Auto-lift so base sits on slab (assumes STL in mm)
-    z_lift = 0.0
     try:
         import trimesh
-        tm = trimesh.load_mesh(str(Potwithoutthelid_path), process=False)
+        tm = trimesh.load_mesh(str(pot_path), process=False)
         zmin = float(tm.bounds[0, 2])
         z_lift = -zmin * 0.001
         size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
         print(f"Pot size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
     except Exception:
         pass
+    pot.T = SE3(-2, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0)  # manual placement
+    env.add(pot)
 
-    Potwithoutthelid.T = SE3(-2, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0) #manual positioning of the pot
-    env.add(Potwithoutthelid)
-
-    # WORK_TABLE_BS(STL) — placements unchanged
     # -------------------------
-    WORK_TABLE_BS_path = Path(__file__).parent / "assets" / "rightwayup.stl"
-    WORK_TABLE_BS = sg.Mesh(
-        filename=str(WORK_TABLE_BS_path),
-        scale=[0.001, 0.001, 0.001],  # keep as-is
+    # Work table (STL)
+    # -------------------------
+    wt_path = Path(__file__).parent / "assets" / "rightwayup.stl"
+    wt = sg.Mesh(
+        filename=str(wt_path),
+        scale=[0.001, 0.001, 0.001],
         color=[0.70, 0.70, 0.70, 1.0],
     )
-
-    # Auto-lift so base sits on slab (assumes STL in mm)
-    z_lift = 0.0
     try:
         import trimesh
-        tm = trimesh.load_mesh(str(WORK_TABLE_BS), process=False)
+        tm = trimesh.load_mesh(str(wt_path), process=False)
         zmin = float(tm.bounds[0, 2])
-        z_lift = -zmin * 0.001
-        size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
-        print(f"Pot size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+        _ = (tm.bounds[1] - tm.bounds[0]) * 0.001
     except Exception:
         pass
+    wt.T = SE3(0, 0, 0) @ SE3.Rz(0)
+    env.add(wt)
 
-    #manual positioning of the table
-    WORK_TABLE_BS.T = SE3(0, 0, 0) @ SE3.Rz(0) #manual positioning of the pot
-    env.add(WORK_TABLE_BS)
-
-    #-------------------------
-    #Linear UR3 — placements unchanged
     # -------------------------
-    ur3 = LinearUR3()  # uses class assets
+    # Linear UR3
+    # -------------------------
+    ur3 = LinearUR3()
     RAIL_X0 = 0.4
     RAIL_Y  = -1
     RAIL_Z  = FLOOR_TOP + 0.003
-    YAW     = math.pi / 90  # keep as-is
-
+    YAW     = math.pi / 90
     ur3.base = SE3(RAIL_X0, RAIL_Y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
     ur3.add_to_env(env)
 
     # -------------------------
-    # CR3 — placements unchanged (no motion yet)
+    # CR3
     # -------------------------
     CR3_FILE = Path(__file__).parent / "Cr3UR3editon.py"
     CR3Class = _load_robot_class(CR3_FILE, ("CR3", "Cr3UR3editon", "DobotCR3", "RobotCR3"))
     cr3 = CR3Class()
 
     CR3_X, CR3_Y = -1.2, 0.45
-    CR3_Z        = 0.945 + 0.003  # keep as-is (or switch to table_top_z + 0.003 later)
+    CR3_Z        = 0.945 + 0.003
     CR3_YAW      = -math.pi / 2
-
     base0_cr3 = getattr(cr3, "base", SE3())
     cr3.base = SE3(CR3_X, CR3_Y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0_cr3
-
     try:
         q_spawn = cr3.q.copy()
     except Exception:
@@ -223,17 +244,13 @@ def main():
     cr3.q = q_spawn
     if hasattr(cr3, "qtest"):
         cr3.qtest = q_spawn
-
-    if hasattr(cr3, "add_to_env"):
-        cr3.add_to_env(env)
-    else:
-        env.add(cr3)
+    cr3.add_to_env(env)
     env.step(0.02)
 
     # -------------------------
-    # CR16 — placements unchanged (no motion yet)
+    # CR16
     # -------------------------
-    CR16_FILE = Path(__file__).parent / "CR16Creator.py"  # change if different
+    CR16_FILE = Path(__file__).parent / "CR16Creator.py"
     try:
         CR16Class = _load_robot_class(CR16_FILE, ("CR16", "DobotCR16", "RobotCR16", "Cr16", "Cr16UR3Edition"))
         try:
@@ -245,14 +262,11 @@ def main():
         cr16 = None
 
     if cr16 is not None:
-        # NOTE: keep your manual Z (as requested)
         CR16_X, CR16_Y = -1.2, -1
-        CR16_Z = 0.945 + 0.003  # keep as-is
+        CR16_Z = 0.945 + 0.003
         CR16_YAW = +math.pi / 2
-
         base0_cr16 = getattr(cr16, "base", SE3())
         cr16.base = SE3(CR16_X, CR16_Y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0_cr16
-
         try:
             if hasattr(cr16, "q_home"):
                 q_spawn16 = cr16.q_home
@@ -263,35 +277,87 @@ def main():
         except Exception:
             q_spawn16 = np.zeros(getattr(cr16, "n", 6))
         cr16.q = q_spawn16
-
         try:
-            if hasattr(cr16, "add_to_env"):
-                cr16.add_to_env(env)
-            else:
-                from ir_support import CylindricalDHRobotPlot
-                CylindricalDHRobotPlot(cr16).add_to_env(env)
+            cr16.add_to_env(env)
             env.step(0.02)
         except Exception as e:
             print("[CR16] Visual add failed:", e)
 
     # -------------------------
-    # Phase 1 complete: everything generated & visible, no movement yet
+    # All visible
     # -------------------------
     env.step(0.02)
-    print("[Scene] All robots added. Starting motion phase...")
+    print("[Scene] All robots added. Starting motion phase…")
 
-    # -------------------------
-    # Phase 2: Motion (after everything exists)
-    # -------------------------
+    # =========================
+    # Move BOTH CR3 and CR16 to the POT using JTRAJ
+    # =========================
+    px, py, pz = _T_translation(pot.T)
 
-    # Comfortable starting posture (rail) — unchanged logic, not animated
-    q = ur3.q.copy()
-    q[0] = 0.0  # prismatic rail joint (limits in class: [-0.8, 0])
-    ur3.q = q
-    env.step(0.02)
+    # Common orientation: tool Z pointing down.
+    R_DOWN = SE3.Rx(math.pi)
 
-    # Optional wiggle: CR3
-    if RUN_WIGGLE_CR3 and cr3 is not None:
+    # ---- CR3 plan (hover → touch → hover), ALL JTRAJ ----
+    try:
+        HOVER_Z_CR3    = 0.22      # edit this height if needed
+        APPROACH_Z_CR3 = 0.08
+        SEG_S_CR3      = 2.0
+
+        T_hover_cr3 = SE3(px, py, pz + HOVER_Z_CR3) * R_DOWN
+        T_touch_cr3 = SE3(px, py, pz + APPROACH_Z_CR3) * R_DOWN
+
+        q0 = cr3.q.copy()
+        q_hover, ok1 = solve_ik_relaxed(cr3, T_hover_cr3, qseed=q0)
+        q_touch, ok2 = solve_ik_relaxed(cr3, T_touch_cr3, qseed=q_hover)
+
+        if ok1:
+            print("[CR3] jtraj → hover")
+            q_end = animate_jtraj(cr3, env, q0, q_hover, SEG_S_CR3, dt=DT)
+        else:
+            print("[CR3] IK to hover failed; skipping CR3 move.")
+            q_end = q0
+
+        if ok2:
+            print("[CR3] jtraj → touch")
+            q_end = animate_jtraj(cr3, env, q_end, q_touch, SEG_S_CR3, dt=DT)
+            print("[CR3] jtraj → back to hover")
+            animate_jtraj(cr3, env, q_end, q_hover, SEG_S_CR3, dt=DT)
+    except Exception as e:
+        print("[CR3] Move error:", e)
+
+    # ---- CR16 plan (hover → touch → hover), ALL JTRAJ ----
+    if cr16 is not None:
+        try:
+            HOVER_Z_CR16    = 0.25   # edit this height if needed
+            APPROACH_Z_CR16 = 0.07
+            SEG_S_CR16      = 2.0
+
+            T_hover_cr16 = SE3(px, py, pz + HOVER_Z_CR16) * R_DOWN
+            T_touch_cr16 = SE3(px, py, pz + APPROACH_Z_CR16) * R_DOWN
+
+            q0 = cr16.q.copy()
+            q_hover, ok1 = solve_ik_relaxed(cr16, T_hover_cr16, qseed=q0)
+            q_touch, ok2 = solve_ik_relaxed(cr16, T_touch_cr16, qseed=q_hover)
+
+            if ok1:
+                print("[CR16] jtraj → hover")
+                q_end = animate_jtraj(cr16, env, q0, q_hover, SEG_S_CR16, dt=DT)
+            else:
+                print("[CR16] IK to hover failed; skipping CR16 move.")
+                q_end = q0
+
+            if ok2:
+                print("[CR16] jtraj → touch")
+                q_end = animate_jtraj(cr16, env, q_end, q_touch, SEG_S_CR16, dt=DT)
+                print("[CR16] jtraj → back to hover")
+                animate_jtraj(cr16, env, q_end, q_hover, SEG_S_CR16, dt=DT)
+        except Exception as e:
+            print("[CR16] Move error:", e)
+
+    # =========================
+    # Optional extras
+    # =========================
+    if RUN_WIGGLE_CR3:
         try:
             T = 2.0
             t = np.arange(0, T + DT, DT)
@@ -307,8 +373,7 @@ def main():
         except Exception as _e:
             print("[CR3] Wiggle skipped:", _e)
 
-    # Optional wiggle: CR16
-    if RUN_WIGGLE_CR16 and cr16 is not None:
+    if cr16 is not None and RUN_WIGGLE_CR16:
         try:
             T = 2.0
             t = np.arange(0, T + DT, DT)
@@ -324,20 +389,19 @@ def main():
         except Exception as _e:
             print("[CR16] Wiggle skipped:", _e)
 
-    # Optional demo: slide the UR3 rail
     if RUN_RAIL_SLIDE:
         q_start = ur3.q.copy()
         q_goal  = q_start.copy()
-        q_goal[0] = -0.8  # full travel toward negative X
+        q_goal[0] = -0.8
         T = 3.0
         t = np.arange(0, T + DT, DT)
-        traj = rtb.jtraj(q_start, q_goal, t)  # LSPB with zero vel at ends
+        traj = rtb.jtraj(q_start, q_goal, t)
         for qk in traj.q:
             ur3.q = qk
             env.step(DT)
             time.sleep(DT)
 
-    # Camera + hold — unchanged
+    # Camera + hold
     env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
     print("Open Swift at http://localhost:52100")
     env.hold()
