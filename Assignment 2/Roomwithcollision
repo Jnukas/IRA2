@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+# room_only_with_collision.py — integrated collision detection
+from __future__ import annotations
+
+from pathlib import Path
+import math
+import time
+import importlib.util
+import inspect
+
+import numpy as np
+import swift
+import spatialgeometry as sg
+import roboticstoolbox as rtb
+from spatialmath import SE3
+
+from room_utils import apply_swift_browser_fix, make_room
+from ir_support.robots.LinearUR3 import LinearUR3
+
+
+# ===== Collision Detection Functions =====
+def cuboid_mesh_data(cuboid: sg.Cuboid):
+    """
+    Build world-space vertices, face index lists (quads), and face normals
+    for a spatialgeometry.Cuboid.
+    """
+    scale = getattr(cuboid, "scale", None)
+    if scale is None:
+        scale = getattr(cuboid, "size", [1.0, 1.0, 1.0])
+    sx, sy, sz = [float(s) for s in scale]
+    hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
+
+    # local vertices (centered at origin)
+    Vloc = np.array([
+        [-hx, -hy, -hz],  # 0
+        [+hx, -hy, -hz],  # 1
+        [+hx, +hy, -hz],  # 2
+        [-hx, +hy, -hz],  # 3
+        [-hx, -hy, +hz],  # 4
+        [+hx, -hy, +hz],  # 5
+        [+hx, +hy, +hz],  # 6
+        [-hx, +hy, +hz],  # 7
+    ], dtype=float)
+
+    # transform to world using cuboid.T
+    T = cuboid.T if hasattr(cuboid.T, "A") else SE3(cuboid.T)
+    R = T.R
+    t = T.t
+    Vworld = (R @ Vloc.T).T + t
+
+    # faces as quads (indices into Vworld)
+    faces = [
+        np.array([0, 1, 2, 3], dtype=int),  # bottom (z-)
+        np.array([4, 5, 6, 7], dtype=int),  # top (z+)
+        np.array([0, 1, 5, 4], dtype=int),  # y-
+        np.array([3, 2, 6, 7], dtype=int),  # y+
+        np.array([0, 3, 7, 4], dtype=int),  # x-
+        np.array([1, 2, 6, 5], dtype=int),  # x+
+    ]
+
+    # per-face normals (world)
+    normals = []
+    for f in faces:
+        a, b, c = Vworld[f[0]], Vworld[f[1]], Vworld[f[2]]
+        n = np.cross(b - a, c - a)
+        n_norm = np.linalg.norm(n)
+        if n_norm > 1e-12:
+            n = n / n_norm
+        normals.append(n)
+    normals = np.asarray(normals, float)
+
+    return Vworld, faces, normals
+
+
+def line_plane_intersection(n, p0, l0, l1, eps=1e-9):
+    """Intersect segment l0->l1 with plane (n·(X - p0)=0)."""
+    u = np.asarray(l1, float) - np.asarray(l0, float)
+    denom = np.dot(n, u)
+    if abs(denom) < eps:
+        return None, False
+    w = np.asarray(p0, float) - np.asarray(l0, float)
+    sI = np.dot(n, w) / denom
+    if sI < 0.0 or sI > 1.0:
+        return None, False
+    P = np.asarray(l0, float) + sI * u
+    return P, True
+
+
+def triangulate_face(face_idx):
+    """Return triangle list from a 3/4/…-gon index list."""
+    if len(face_idx) == 3:
+        return [tuple(face_idx)]
+    if len(face_idx) == 4:
+        i0, i1, i2, i3 = face_idx
+        return [(i0, i1, i2), (i0, i2, i3)]
+    # generic fan
+    out = []
+    for k in range(1, len(face_idx) - 1):
+        out.append((face_idx[0], face_idx[k], face_idx[k + 1]))
+    return out
+
+
+def point_in_triangle(P, A, B, C, eps=1e-9):
+    """Barycentric point-in-triangle (coplanar)."""
+    v0 = C - A
+    v1 = B - A
+    v2 = P - A
+    dot00 = np.dot(v0, v0)
+    dot01 = np.dot(v0, v1)
+    dot02 = np.dot(v0, v2)
+    dot11 = np.dot(v1, v1)
+    dot12 = np.dot(v1, v2)
+    denom = dot00 * dot11 - dot01 * dot01
+    if abs(denom) < eps:
+        return False
+    u = (dot11 * dot02 - dot01 * dot12) / denom
+    v = (dot00 * dot12 - dot01 * dot02) / denom
+    return (u >= -eps) and (v >= -eps) and (u + v <= 1.0 + eps)
+
+
+def get_link_points(robot, q=None):
+    """Return Nx3 joint origins (base + each link end) in world."""
+    if q is None:
+        q = robot.q
+    T_all = robot.fkine_all(q)
+    pts = [robot.base.t.tolist()]
+    for T in T_all:
+        pts.append(T.t.tolist())
+    return np.asarray(pts, float)
+
+
+def check_env_collision(robot, q, vertices, faces, normals):
+    """Segment–triangle collisions for all links vs environment faces."""
+    pts = get_link_points(robot, q)
+    hits = []
+    for i in range(len(pts) - 1):
+        A = pts[i]
+        B = pts[i + 1]
+        for fidx, face in enumerate(faces):
+            n = normals[fidx]
+            p0 = vertices[face[0]]
+            P, ok = line_plane_intersection(n, p0, A, B)
+            if not ok:
+                continue
+            for tri in triangulate_face(face):
+                Atri, Btri, Ctri = vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]
+                if point_in_triangle(P, Atri, Btri, Ctri):
+                    hits.append(P.tolist())
+                    break
+    return (len(hits) > 0), hits
+
+
+def segment_segment_distance(P0, P1, Q0, Q1, eps=1e-9):
+    """Compute minimum distance between two line segments."""
+    u = P1 - P0
+    v = Q1 - Q0
+    w0 = P0 - Q0
+    a = np.dot(u, u)
+    b = np.dot(u, v)
+    c = np.dot(v, v)
+    d = np.dot(u, w0)
+    e = np.dot(v, w0)
+    denom = a * c - b * b
+    if denom < eps:
+        sc = 0.0
+        tc = (e / c) if c > eps else 0.0
+    else:
+        sc = (b * e - c * d) / denom
+        tc = (a * e - b * d) / denom
+    sc = np.clip(sc, 0.0, 1.0)
+    tc = np.clip(tc, 0.0, 1.0)
+    dP = w0 + sc * u - tc * v
+    return np.linalg.norm(dP)
+
+
+def check_self_collision(robot, q, thresh=0.04):
+    """Check self-collision using segment-segment distance."""
+    pts = get_link_points(robot, q)
+    hit_pairs = []
+    for i in range(len(pts) - 1):
+        P0, P1 = pts[i], pts[i + 1]
+        for j in range(i + 2, len(pts) - 1):
+            if j == i or j == i + 1:
+                continue
+            Q0, Q1 = pts[j], pts[j + 1]
+            if segment_segment_distance(np.asarray(P0), np.asarray(P1),
+                                        np.asarray(Q0), np.asarray(Q1)) < thresh:
+                hit_pairs.append((i, j))
+    return (len(hit_pairs) > 0), hit_pairs
+
+
+# ===== Motion toggles =====
+RUN_WIGGLE_CR3 = True
+RUN_WIGGLE_CR16 = True
+RUN_RAIL_SLIDE = True
+COLLISION_CHECK = True  # Enable collision checking during motion
+FPS = 60
+DT = 1.0 / FPS
+
+
+def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
+    """Dynamic loader that returns the first matching RTB robot class."""
+    if not pyfile.exists():
+        raise FileNotFoundError(f"Robot file not found: {pyfile}")
+
+    spec = importlib.util.spec_from_file_location("user_robot_module", str(pyfile))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    # 1) try preferred names first
+    for name in prefer_names:
+        if hasattr(mod, name) and inspect.isclass(getattr(mod, name)):
+            return getattr(mod, name)
+
+    # 2) else scan for any RTB robot subclass
+    candidates = []
+    RobotBase = getattr(rtb, "Robot", tuple())
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj):
+            try:
+                if issubclass(obj, (rtb.ERobot, rtb.DHRobot, RobotBase)):
+                    candidates.append((name, obj))
+            except Exception:
+                pass
+
+    if candidates:
+        print(f"[loader] Using {candidates[0][0]} from {pyfile.name}")
+        return candidates[0][1]
+
+    raise ImportError(f"No robot class found in {pyfile.name}. "
+                      f"Export a class like `class MyBot(DHRobot/ERobot): ...`.")
+
+
+def main():
+    # -------------------------
+    # Launch Swift
+    # -------------------------
+    apply_swift_browser_fix()
+    env = swift.Swift()
+    env.launch(realtime=True, browser=None, host="127.0.0.1", port=52100, ws_port=53100)
+
+    # -------------------------
+    # Room (constants + build)
+    # -------------------------
+    ROOM_W = 6.0
+    ROOM_D = 6.0
+    FLOOR_TOP = 0.005
+
+    make_room(
+        env,
+        room_w=ROOM_W,
+        room_d=ROOM_D,
+        floor_t=0.10,
+        open_side="+Y",
+        floor_top=FLOOR_TOP,
+    )
+
+    # -------------------------
+    # Build environment collision geometry
+    # -------------------------
+    # We'll store all collision objects here
+    collision_objects = []
+
+    # -------------------------
+    # Oven (STL)
+    # -------------------------
+    oven_path = Path(__file__).parent / "assets" / "oven2.stl"
+    oven = sg.Mesh(
+        filename=str(oven_path),
+        scale=[0.05, 0.05, 0.05],
+        color=[0.70, 0.70, 0.70, 1.0],
+    )
+
+    z_lift = 0.0
+    try:
+        import trimesh
+        tm = trimesh.load_mesh(str(oven_path), process=False)
+        zmin = float(tm.bounds[0, 2])
+        z_lift = -zmin * 0.001
+        size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
+        print(f"Oven size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+    except Exception:
+        pass
+
+    oven.T = SE3(0.0, -ROOM_D / 2 + 0.60, FLOOR_TOP + z_lift) @ SE3.Rz(math.pi)
+    env.add(oven)
+
+    # -------------------------
+    # Table (STL)
+    # -------------------------
+    table_path = Path(__file__).parent / "assets" / "table.stl"
+    TABLE_SCALE = [1, 1, 1]
+    SCALE_MM = 1.0
+
+    table = sg.Mesh(
+        filename=str(table_path),
+        scale=TABLE_SCALE,
+        color=[0.50, 0.50, 0.50, 1.0],
+    )
+
+    z_lift_table = 0.0
+    try:
+        import trimesh
+        tm_tbl = trimesh.load_mesh(str(table_path), process=False)
+        zmin_tbl = float(tm_tbl.bounds[0, 2])
+        z_lift_table = -zmin_tbl * SCALE_MM
+        size_tbl_m = (tm_tbl.bounds[1] - tm_tbl.bounds[0]) * SCALE_MM
+        print(f"Table size (m): X={size_tbl_m[0]:.3f}  Y={size_tbl_m[1]:.3f}  Z={size_tbl_m[2]:.3f}")
+    except Exception:
+        size_tbl_m = None
+
+    try:
+        table_top_z = FLOOR_TOP + z_lift_table + float(size_tbl_m[2])
+    except Exception:
+        table_top_z = FLOOR_TOP + z_lift_table + 0.75
+
+    table.T = SE3(-1.5, -0.5, FLOOR_TOP + z_lift_table) @ SE3.Rz(math.pi / 2)
+    env.add(table)
+
+    # -------------------------
+    # Pot without lid (STL)
+    # -------------------------
+    Potwithoutthelid_path = Path(__file__).parent / "assets" / "Potwithoutthelid.stl"
+    Potwithoutthelid = sg.Mesh(
+        filename=str(Potwithoutthelid_path),
+        scale=[0.002, 0.002, 0.002],
+        color=[1, 0, 0, 1.0],
+    )
+
+    z_lift = 0.0
+    try:
+        import trimesh
+        tm = trimesh.load_mesh(str(Potwithoutthelid_path), process=False)
+        zmin = float(tm.bounds[0, 2])
+        z_lift = -zmin * 0.001
+        size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
+        print(f"Pot size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+    except Exception:
+        pass
+
+    Potwithoutthelid.T = SE3(-1.75, -0.5, 0.945 + 0.003) @ SE3.Rz(0.0)
+    env.add(Potwithoutthelid)
+
+    # -------------------------
+    # Work Table (STL)
+    # -------------------------
+    WORK_TABLE_BS2_path = Path(__file__).parent / "assets" / "rightwayup.stl"
+    WORK_TABLE_BS2 = sg.Mesh(
+        filename=str(WORK_TABLE_BS2_path),
+        scale=[0.001, 0.001, 0.001],
+        color=[0.50, 0.50, 0.50, 1.0],
+    )
+
+    z_lift = 0.0
+    try:
+        import trimesh
+        tm = trimesh.load_mesh(str(WORK_TABLE_BS2_path), process=False)
+        zmin = float(tm.bounds[0, 2])
+        z_lift = -zmin * 0.001
+        size_m = (tm.bounds[1] - tm.bounds[0]) * 0.001
+        print(f"Work Table size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+    except Exception:
+        pass
+
+    WORK_TABLE_BS2.T = SE3(1.50, 0, z_lift + FLOOR_TOP) @ SE3.RPY([-90, 0, 0], order='xyz', unit='deg')
+    env.add(WORK_TABLE_BS2)
+
+    # -------------------------
+    # Add collision cuboids (invisible bounding boxes for collision checking)
+    # -------------------------
+    # Example: add a collision box around the oven area
+    oven_collision = sg.Cuboid(scale=[0.6, 0.5, 0.8], color=[1, 0, 0, 0.0])  # transparent
+    oven_collision.T = SE3(0.0, -ROOM_D / 2 + 0.60, FLOOR_TOP + 0.4)
+    collision_objects.append(oven_collision)
+
+    # Example: add collision box around pot
+    pot_collision = sg.Cuboid(scale=[0.15, 0.15, 0.15], color=[1, 0, 0, 0.0])
+    pot_collision.T = SE3(-1.75, -0.5, 0.945 + 0.08)
+    collision_objects.append(pot_collision)
+
+    # Build collision geometry for all objects
+    # We'll create separate collision geometries: one for UR3 (without rail) and one for others
+    ALL_VERTS, ALL_FACES, ALL_NORMS = [], [], []
+    for obj in collision_objects:
+        v, f, n = cuboid_mesh_data(obj)
+        offset = len(ALL_VERTS)
+        ALL_VERTS.extend(v.tolist())
+        ALL_FACES.extend([face + offset for face in f])
+        ALL_NORMS.extend(n.tolist())
+    ALL_VERTS = np.array(ALL_VERTS)
+    ALL_NORMS = np.array(ALL_NORMS)
+    
+    # Store the same geometry for UR3 (no rail collision needed - it's part of the robot)
+    UR3_VERTS, UR3_FACES, UR3_NORMS = ALL_VERTS.copy(), ALL_FACES.copy(), ALL_NORMS.copy()
+
+    # -------------------------
+    # Collision banner
+    # -------------------------
+    collision_banner = swift.Label(" ")
+    env.add(collision_banner)
+
+    # -------------------------
+    # Linear UR3
+    # -------------------------
+    ur3 = LinearUR3()
+    RAIL_X0 = 0.4
+    RAIL_Y = -1
+    RAIL_Z = FLOOR_TOP + 0.003
+    YAW = math.pi / 90
+
+    ur3.base = SE3(RAIL_X0, RAIL_Y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
+    ur3.add_to_env(env)
+
+    # -------------------------
+    # CR3
+    # -------------------------
+    CR3_FILE = Path(__file__).parent / "Cr3UR3editon.py"
+    CR3Class = _load_robot_class(CR3_FILE, ("CR3", "Cr3UR3editon", "DobotCR3", "RobotCR3"))
+    cr3 = CR3Class()
+
+    CR3_X, CR3_Y = -1.2, 0.45
+    CR3_Z = 0.945 + 0.003
+    CR3_YAW = -math.pi / 2
+
+    base0_cr3 = getattr(cr3, "base", SE3())
+    cr3.base = SE3(CR3_X, CR3_Y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0_cr3
+
+    try:
+        q_spawn = cr3.q.copy()
+    except Exception:
+        q_spawn = np.zeros(getattr(cr3, "n", 6))
+    cr3.q = q_spawn
+    if hasattr(cr3, "qtest"):
+        cr3.qtest = q_spawn
+
+    if hasattr(cr3, "add_to_env"):
+        cr3.add_to_env(env)
+    else:
+        env.add(cr3)
+    env.step(0.02)
+
+    # -------------------------
+    # CR16
+    # -------------------------
+    CR16_FILE = Path(__file__).parent / "CR16Creator.py"
+    try:
+        CR16Class = _load_robot_class(CR16_FILE, ("CR16", "DobotCR16", "RobotCR16", "Cr16", "Cr16UR3Edition"))
+        try:
+            cr16 = CR16Class()
+        except TypeError:
+            cr16 = CR16Class(use_mesh=False)
+    except Exception as e:
+        print("[CR16] Load skipped:", e)
+        cr16 = None
+
+    if cr16 is not None:
+        CR16_X, CR16_Y = -1.2, -1
+        CR16_Z = 0.945 + 0.003
+        CR16_YAW = +math.pi / 2
+
+        base0_cr16 = getattr(cr16, "base", SE3())
+        cr16.base = SE3(CR16_X, CR16_Y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0_cr16
+
+        try:
+            if hasattr(cr16, "q_home"):
+                q_spawn16 = cr16.q_home
+            elif hasattr(cr16, "qtest"):
+                q_spawn16 = cr16.qtest
+            else:
+                q_spawn16 = cr16.q.copy()
+        except Exception:
+            q_spawn16 = np.zeros(getattr(cr16, "n", 6))
+        cr16.q = q_spawn16
+
+        try:
+            if hasattr(cr16, "add_to_env"):
+                cr16.add_to_env(env)
+            else:
+                from ir_support import CylindricalDHRobotPlot
+                CylindricalDHRobotPlot(cr16).add_to_env(env)
+            env.step(0.02)
+        except Exception as e:
+            print("[CR16] Visual add failed:", e)
+
+    # -------------------------
+    # Scene complete
+    # -------------------------
+    env.step(0.02)
+    print("[Scene] All robots added. Starting motion phase with collision detection...")
+
+    # -------------------------
+    # Motion with collision checking
+    # -------------------------
+    def check_and_update_banner(robot, robot_name="Robot", custom_verts=None, custom_faces=None, custom_norms=None):
+        """Check collisions and update banner."""
+        if not COLLISION_CHECK:
+            return False
+        
+        # Use custom collision geometry if provided (e.g., for UR3 without rail)
+        verts = custom_verts if custom_verts is not None else ALL_VERTS
+        faces = custom_faces if custom_faces is not None else ALL_FACES
+        norms = custom_norms if custom_norms is not None else ALL_NORMS
+        
+        env_hit, _ = check_env_collision(robot, robot.q, verts, faces, norms)
+        self_hit, _ = check_self_collision(robot, robot.q)
+        
+        if env_hit or self_hit:
+            collision_type = []
+            if env_hit:
+                collision_type.append("ENVIRONMENT")
+            if self_hit:
+                collision_type.append("SELF")
+            collision_banner.desc = f"⚠️  {robot_name} COLLISION: {' + '.join(collision_type)}  ⚠️"
+            return True
+        else:
+            collision_banner.desc = " "
+            return False
+
+    # Set comfortable starting posture
+    q = ur3.q.copy()
+    q[0] = 0.0
+    ur3.q = q
+    env.step(0.02)
+    # UR3 uses custom collision geometry (excluding its own rail)
+    check_and_update_banner(ur3, "UR3", UR3_VERTS, UR3_FACES, UR3_NORMS)
+
+    # CR3 move to pot edge with collision checking
+    if RUN_WIGGLE_CR3 and cr3 is not None:
+        try:
+            print("[CR3] Moving to pot edge...")
+            
+            # Pot position (from earlier placement)
+            pot_x, pot_y, pot_z = -1.75, -0.5, 0.945 + 0.003
+            
+            # Target: edge of pot (offset slightly to the side and above)
+            # Approach from the side with tool pointing down
+            target_x = pot_x + 0.10  # 10cm to the side
+            target_y = pot_y
+            target_z = pot_z + 0.20  # 20cm above pot base (near rim)
+            
+            T_target = SE3(target_x, target_y, target_z) @ SE3.Rx(math.pi)  # tool pointing down
+            
+            # Try inverse kinematics with different masks
+            print("[CR3] Computing IK solution...")
+            q_start = cr3.q.copy()
+            
+            sol = cr3.ikine_LM(T_target, q0=q_start)
+            if not sol.success:
+                print("[CR3] Trying IK with relaxed orientation...")
+                sol = cr3.ikine_LM(T_target, q0=q_start, mask=[1,1,1,1,1,0])
+            if not sol.success:
+                print("[CR3] Trying IK with position only...")
+                sol = cr3.ikine_LM(T_target, q0=q_start, mask=[1,1,1,0,0,0])
+            
+            if sol.success:
+                q_goal = sol.q
+                
+                # Check if goal configuration is collision-free
+                env_hit, _ = check_env_collision(cr3, q_goal, ALL_VERTS, ALL_FACES, ALL_NORMS)
+                self_hit, _ = check_self_collision(cr3, q_goal)
+                
+                if env_hit or self_hit:
+                    print("[CR3] Goal configuration in collision, adjusting target...")
+                    # Try a higher position
+                    target_z += 0.10
+                    T_target = SE3(target_x, target_y, target_z) @ SE3.Rx(math.pi)
+                    sol = cr3.ikine_LM(T_target, q0=q_start, mask=[1,1,1,1,1,0])
+                    if sol.success:
+                        q_goal = sol.q
+                    else:
+                        print("[CR3] Could not find collision-free solution")
+                        q_goal = None
+                else:
+                    print("[CR3] Goal configuration is collision-free")
+                
+                if q_goal is not None:
+                    # Animate motion
+                    T = 3.0
+                    t = np.arange(0, T + DT, DT)
+                    traj = rtb.jtraj(q_start, q_goal, t)
+                    
+                    collision_detected = False
+                    for qk in traj.q:
+                        cr3.q = qk
+                        env.step(DT)
+                        if check_and_update_banner(cr3, "CR3"):
+                            if not collision_detected:
+                                print(f"[CR3] Collision detected during motion!")
+                                collision_detected = True
+                        time.sleep(DT)
+                    
+                    if not collision_detected:
+                        print("[CR3] Successfully reached pot edge!")
+                    
+                    # Hold at target for a moment
+                    time.sleep(1.0)
+            else:
+                print("[CR3] IK failed - target may be out of reach")
+                print(f"[CR3] Target position: ({target_x:.3f}, {target_y:.3f}, {target_z:.3f})")
+                
+        except Exception as _e:
+            print("[CR3] Motion to pot failed:", _e)
+            import traceback
+            traceback.print_exc()
+
+    # CR16 wiggle with collision checking
+    if RUN_WIGGLE_CR16 and cr16 is not None:
+        try:
+            print("[CR16] Starting wiggle motion...")
+            T = 2.0
+            t = np.arange(0, T + DT, DT)
+            qs = cr16.q.copy()
+            qg = cr16.q.copy()
+            j = min(2, qs.size - 1)
+            qg[j] += np.deg2rad(12)
+            traj = rtb.jtraj(qs, qg, t)
+            
+            for qk in traj.q:
+                cr16.q = qk
+                env.step(DT)
+                if check_and_update_banner(cr16, "CR16"):
+                    print(f"[CR16] Collision detected at joint config: {qk}")
+                time.sleep(DT)
+        except Exception as _e:
+            print("[CR16] Wiggle skipped:", _e)
+
+    # UR3 rail slide with collision checking
+    if RUN_RAIL_SLIDE:
+        print("[UR3] Starting rail slide...")
+        q_start = ur3.q.copy()
+        q_goal = q_start.copy()
+        q_goal[0] = -0.8
+        T = 3.0
+        t = np.arange(0, T + DT, DT)
+        traj = rtb.jtraj(q_start, q_goal, t)
+        
+        for qk in traj.q:
+            ur3.q = qk
+            env.step(DT)
+            # UR3 uses custom collision geometry (excluding its own rail)
+            if check_and_update_banner(ur3, "UR3", UR3_VERTS, UR3_FACES, UR3_NORMS):
+                print(f"[UR3] Collision detected at joint config: {qk}")
+            time.sleep(DT)
+
+    # Final collision check
+    print("\n[Collision Summary]")
+    print(f"UR3 final state: {'COLLISION' if check_and_update_banner(ur3, 'UR3', UR3_VERTS, UR3_FACES, UR3_NORMS) else 'CLEAR'}")
+    if cr3 is not None:
+        print(f"CR3 final state: {'COLLISION' if check_and_update_banner(cr3, 'CR3') else 'CLEAR'}")
+    if cr16 is not None:
+        print(f"CR16 final state: {'COLLISION' if check_and_update_banner(cr16, 'CR16') else 'CLEAR'}")
+
+    # Camera + hold
+    env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
+    print("\nOpen Swift at http://localhost:52100")
+    print("Collision detection is active - banner shows warnings during motion")
+    env.hold()
+
+
+if __name__ == "__main__":
+    main()
