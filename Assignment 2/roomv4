@@ -90,8 +90,8 @@ def main():
     stove_path = Path(__file__).parent / "assets" / "Stove.stl"
     stove = sg.Mesh(
         filename=str(stove_path),
-        scale=[0.001, 0.001, 0.001],  # mm -> m conversion
-        color=[0.30, 0.30, 0.30, 1.0],  # dark gray for stove
+        scale=[1, 1, 1],  # keep as-is
+        color=[0.70, 0.70, 0.70, 1.0],
     )
 
     # Auto-lift so base sits on slab
@@ -247,7 +247,7 @@ def main():
     
     pepper_grinder = add_table_item(
         "pepper_grinder.stl",
-        scale=[0.001, 0.001, 0.001],
+        scale=[1, 1, 1],
         color=[0.2, 0.2, 0.2, 1.0],  # dark gray/black
         x_offset=-0.3,
         y_offset=-0.3,
@@ -256,7 +256,7 @@ def main():
     
     beef = add_table_item(
         "beef.stl",
-        scale=[0.001, 0.001, 0.001],
+        scale=[0.01, 0.01, 0.01],
         color=[0.8, 0.3, 0.3, 1.0],  # reddish for beef
         x_offset=0.0,
         y_offset=0.3,
@@ -274,7 +274,7 @@ def main():
     
     chicken = add_table_item(
         "chicken.stl",
-        scale=[0.001, 0.001, 0.001],
+        scale=[0.01, 0.01, 0.01],
         color=[1.0, 0.9, 0.7, 1.0],  # light tan for chicken
         x_offset=0.3,
         y_offset=0.0,
