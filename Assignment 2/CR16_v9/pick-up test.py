@@ -29,7 +29,6 @@ def ik_solve(robot: CR16, Tep: SE3, qseed=None, vertical=True):
     sol = robot.ikine_LM(Tep, q0=qseed, mask=mask, ilimit=200, slimit=200, tol=1e-9)
     return sol
 
-
 def go(robot: CR16, env: swift.Swift, q_target, steps=120, hold_attached=None):
     """
     Smoothly move robot from current q to q_target.
@@ -56,7 +55,7 @@ def main():
     r.add_to_env(env)
 
     # ---- Pick target config ----
-    x, y = 0.55, 0.10       # set your ground XY here
+    x, y = 0.55, 0.55       # set your ground XY here
     cube_size = 0.04        # 4 cm cube
     half = cube_size / 2.0
     z_ground = 0.0
