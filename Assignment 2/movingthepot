@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# move_pot_with_cr16.py — CR16 picks the pot, moves it sideways, and returns (pot follows tool)
+from __future__ import annotations
+
+from pathlib import Path
+import math
+import time
+import importlib.util
+import inspect
+
+import numpy as np
+import swift
+import spatialgeometry as sg
+import roboticstoolbox as rtb
+from spatialmath import SE3
+
+from room_utils import apply_swift_browser_fix, make_room
+from ir_support.robots.LinearUR3 import LinearUR3
+
+# ===================== Pose helpers (fix numpy vs SE3 mix) =====================
+def T_as_SE3(T_like):
+    """Return an SE3 regardless of whether input is already SE3 or a 4x4 ndarray."""
+    return T_like if hasattr(T_like, "A") or hasattr(T_like, "t") else SE3(T_like)
+
+def set_pose(obj, T: SE3):
+    """Assign pose T to a spatialgeometry object whether it wants SE3 or ndarray."""
+    if isinstance(obj.T, np.ndarray):
+        obj.T = T.A
+    else:
+        obj.T = T
+
+def attach_tool_fixed(T_tool_now, T_obj_now):
+    """Fixed transform {}^{tool}T_obj from current world poses (SE3 or ndarray)."""
+    return T_as_SE3(T_tool_now).inv() * T_as_SE3(T_obj_now)
+
+# ===================== Simple collision utilities (optional banner) =====================
+def cuboid_mesh_data(cuboid: sg.Cuboid):
+    # build world-space vertices for an sg.Cuboid
+    scale = getattr(cuboid, "scale", getattr(cuboid, "size", [1, 1, 1]))
+    sx, sy, sz = [float(s) for s in scale]
+    hx, hy, hz = sx/2, sy/2, sz/2
+    Vloc = np.array([
+        [-hx, -hy, -hz], [hx, -hy, -hz], [hx, hy, -hz], [-hx, hy, -hz],
+        [-hx, -hy,  hz], [hx, -hy,  hz], [hx, hy,  hz], [-hx, hy,  hz],
+    ], float)
+    T = T_as_SE3(cuboid.T)
+    V = (T.R @ Vloc.T).T + T.t
+    faces = [
+        np.array([0,1,2,3]), np.array([4,5,6,7]),
+        np.array([0,1,5,4]), np.array([3,2,6,7]),
+        np.array([0,3,7,4]), np.array([1,2,6,5]),
+    ]
+    norms = []
+    for f in faces:
+        a,b,c = V[f[0]], V[f[1]], V[f[2]]
+        n = np.cross(b-a, c-a)
+        n /= (np.linalg.norm(n) + 1e-12)
+        norms.append(n)
+    return V, faces, np.asarray(norms, float)
+
+def triangulate_face(face_idx):
+    if len(face_idx) == 3: return [tuple(face_idx)]
+    if len(face_idx) == 4: 
+        i0,i1,i2,i3 = face_idx
+        return [(i0,i1,i2), (i0,i2,i3)]
+    out=[]
+    for k in range(1, len(face_idx)-1): out.append((face_idx[0], face_idx[k], face_idx[k+1]))
+    return out
+
+def point_in_triangle(P, A, B, C, eps=1e-9):
+    v0, v1, v2 = C-A, B-A, P-A
+    dot00, dot01 = np.dot(v0,v0), np.dot(v0,v1)
+    dot02, dot11 = np.dot(v0,v2), np.dot(v1,v1)
+    dot12 = np.dot(v1,v2)
+    denom = dot00*dot11 - dot01*dot01
+    if abs(denom) < eps: return False
+    u = (dot11*dot02 - dot01*dot12) / denom
+    v = (dot00*dot12 - dot01*dot02) / denom
+    return (u >= -eps) and (v >= -eps) and (u+v <= 1+eps)
+
+def line_plane_intersection(n, p0, l0, l1, eps=1e-9):
+    u = l1 - l0
+    denom = float(np.dot(n, u))
+    if abs(denom) < eps: return None, False
+    sI = float(np.dot(n, p0 - l0)) / denom
+    if sI < 0.0 or sI > 1.0: return None, False
+    P = l0 + sI * u
+    return P, True
+
+def get_link_points(robot, q=None):
+    if q is None: q = robot.q
+    T_all = robot.fkine_all(q)
+    pts = [T_as_SE3(robot.base).t.tolist()]
+    for T in T_all: pts.append(T.t.tolist())
+    return np.asarray(pts, float)
+
+def check_env_collision(robot, q, vertices, faces, normals):
+    pts = get_link_points(robot, q)
+    for i in range(len(pts)-1):
+        A, B = pts[i], pts[i+1]
+        for f, n in zip(faces, normals):
+            P, ok = line_plane_intersection(n, vertices[f[0]], A, B)
+            if not ok: continue
+            for tri in triangulate_face(f):
+                Atri,Btri,Ctri = vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]
+                if point_in_triangle(P, Atri, Btri, Ctri):
+                    return True
+    return False
+
+def segment_segment_distance(P0, P1, Q0, Q1, eps=1e-9):
+    u, v, w0 = P1-P0, Q1-Q0, P0-Q0
+    a, b, c = np.dot(u,u), np.dot(u,v), np.dot(v,v)
+    d, e = np.dot(u,w0), np.dot(v,w0)
+    denom = a*c - b*b
+    if denom < eps:
+        sc = 0.0
+        tc = (e/c) if c>eps else 0.0
+    else:
+        sc = (b*e - c*d)/denom
+        tc = (a*e - b*d)/denom
+    sc = np.clip(sc, 0.0, 1.0)
+    tc = np.clip(tc, 0.0, 1.0)
+    dP = w0 + sc*u - tc*v
+    return np.linalg.norm(dP)
+
+def check_self_collision(robot, q, thresh=0.04):
+    pts = get_link_points(robot, q)
+    for i in range(len(pts)-1):
+        P0,P1 = pts[i], pts[i+1]
+        for j in range(i+2, len(pts)-1):
+            Q0,Q1 = pts[j], pts[j+1]
+            if segment_segment_distance(P0,P1,Q0,Q1) < thresh:
+                return True
+    return False
+
+# ===================== IK + motion helpers =====================
+def ik_any(robot, T_goal: SE3, qseed):
+    # try full 6D, then relax yaw, then position-only
+    sol = robot.ikine_LM(T_goal, q0=qseed)
+    if sol.success: return sol.q, True
+    sol = robot.ikine_LM(T_goal, q0=qseed, mask=[1,1,1,1,1,0])
+    if sol.success: return sol.q, True
+    sol = robot.ikine_LM(T_goal, q0=qseed, mask=[1,1,1,0,0,0])
+    return sol.q, sol.success
+
+def go_jtraj(robot, env, q_start, q_goal, seconds, dt, on_step=None, banner=None,
+             env_V=None, env_F=None, env_N=None, name="Robot"):
+    n = max(2, int(seconds/dt))
+    t = np.linspace(0, seconds, n)
+    traj = rtb.jtraj(q_start, q_goal, t).q
+    for qk in traj:
+        robot.q = qk
+        if on_step: on_step(qk)
+        env.step(dt)
+        # optional collision banner
+        if banner is not None and env_V is not None:
+            env_hit  = check_env_collision(robot, qk, env_V, env_F, env_N)
+            self_hit = check_self_collision(robot, qk)
+            if env_hit or self_hit:
+                parts=[]
+                if env_hit: parts.append("ENV")
+                if self_hit: parts.append("SELF")
+                banner.desc = f"⚠️  {name} COLLISION: {'+'.join(parts)}  ⚠️"
+            else:
+                banner.desc = " "
+        time.sleep(dt)
+
+# ===================== Dynamic loader (CR3/CR16) =====================
+def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
+    if not pyfile.exists():
+        raise FileNotFoundError(f"Robot file not found: {pyfile}")
+    spec = importlib.util.spec_from_file_location("user_robot_module", str(pyfile))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    for name in prefer_names:
+        if hasattr(mod, name) and inspect.isclass(getattr(mod, name)):
+            return getattr(mod, name)
+    candidates=[]
+    RobotBase = getattr(rtb, "Robot", tuple())
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj):
+            try:
+                if issubclass(obj, (rtb.ERobot, rtb.DHRobot, RobotBase)):
+                    candidates.append((name, obj))
+            except Exception:
+                pass
+    if candidates:
+        print(f"[loader] Using {candidates[0][0]} from {pyfile.name}")
+        return candidates[0][1]
+    raise ImportError(f"No robot class found in {pyfile.name}")
+
+# ===================== Main =====================
+def main():
+    # ---- Swift ----
+    apply_swift_browser_fix()
+    env = swift.Swift()
+    env.launch(realtime=True, browser=None, host="127.0.0.1", port=52100, ws_port=53100)
+
+    # ---- Room ----
+    ROOM_W, ROOM_D, FLOOR_TOP = 6.0, 6.0, 0.005
+    make_room(env, room_w=ROOM_W, room_d=ROOM_D, floor_t=0.10, open_side="+Y", floor_top=FLOOR_TOP)
+
+    # ---- Oven ----
+    oven_path = Path(__file__).parent / "assets" / "oven2.stl"
+    oven = sg.Mesh(filename=str(oven_path), scale=[0.05,0.05,0.05], color=[0.7,0.7,0.7,1])
+    set_pose(oven, SE3(0.0, -ROOM_D/2 + 0.60, FLOOR_TOP) @ SE3.Rz(math.pi))
+    env.add(oven)
+
+    # ---- Table ----
+    table_path = Path(__file__).parent / "assets" / "table.stl"
+    table = sg.Mesh(filename=str(table_path), scale=[1,1,1], color=[0.82,0.82,0.82,1])
+    set_pose(table, SE3(-1.5, -0.5, FLOOR_TOP) @ SE3.Rz(math.pi/2))
+    env.add(table)
+
+    # ---- Pot ----
+    pot_path = Path(__file__).parent / "assets" / "Potwithoutthelid.stl"
+    pot = sg.Mesh(filename=str(pot_path), scale=[0.002,0.002,0.002], color=[0.9,0.2,0.2,1])
+    set_pose(pot, SE3(-1.75, -0.5, 0.945 + 0.003))
+    env.add(pot)
+
+    # ---- Work table ----
+    wt_path = Path(__file__).parent / "assets" / "rightwayup.stl"
+    work_tbl = sg.Mesh(filename=str(wt_path), scale=[0.001,0.001,0.001], color=[0.6,0.6,0.6,1])
+    set_pose(work_tbl, SE3(1.50, 0, FLOOR_TOP) @ SE3.RPY([-90,0,0], order='xyz', unit='deg'))
+    env.add(work_tbl)
+
+    # ---- Collision boxes (env) ----
+    collision_objs = []
+    oven_col = sg.Cuboid(scale=[0.6, 0.5, 0.8], color=[1,0,0,0.0]); set_pose(oven_col, SE3(0.0, -ROOM_D/2 + 0.60, FLOOR_TOP + 0.4)); collision_objs.append(oven_col)
+    pot_col  = sg.Cuboid(scale=[0.15, 0.15, 0.15], color=[1,0,0,0.0]); set_pose(pot_col, T_as_SE3(pot.T) @ SE3.Tz(0.08)); collision_objs.append(pot_col)
+
+    V_all, F_all, N_all = [], [], []
+    for obj in collision_objs:
+        v, f, n = cuboid_mesh_data(obj)
+        offset = len(V_all)
+        V_all.extend(v.tolist())
+        F_all.extend([fi + offset for fi in f])
+        N_all.extend(n.tolist())
+    V_all = np.asarray(V_all, float)
+    N_all = np.asarray(N_all, float)
+
+    # ---- Collision banner ----
+    banner = swift.Label(" "); env.add(banner)
+
+    # ---- Robots ----
+    ur3 = LinearUR3()
+    ur3.base = SE3(0.4, -1.0, FLOOR_TOP + 0.003) @ SE3.Rz(math.pi/90) @ ur3.base
+    ur3.add_to_env(env)
+
+    CR3_FILE = Path(__file__).parent / "Cr3UR3editon.py"
+    CR3Class = _load_robot_class(CR3_FILE, ("CR3","Cr3UR3editon","DobotCR3","RobotCR3"))
+    cr3 = CR3Class()
+    cr3.base = SE3(-1.2, 0.45, 0.945 + 0.003) @ SE3.Rz(-math.pi/2) @ T_as_SE3(getattr(cr3, "base", SE3()))
+    cr3.q = getattr(cr3, "q", np.zeros(getattr(cr3,"n",6)))
+    cr3.add_to_env(env)
+
+    CR16_FILE = Path(__file__).parent / "CR16Creator.py"
+    try:
+        CR16Class = _load_robot_class(CR16_FILE, ("CR16","DobotCR16","RobotCR16","Cr16","Cr16UR3Edition"))
+        try:
+            cr16 = CR16Class()
+        except TypeError:
+            cr16 = CR16Class(use_mesh=False)
+    except Exception as e:
+        print("[CR16] Load skipped:", e)
+        cr16 = None
+
+    if cr16 is not None:
+        cr16.base = SE3(-1.2, -1.0, 0.945 + 0.003) @ SE3.Rz(+math.pi/2) @ T_as_SE3(getattr(cr16, "base", SE3()))
+        try:
+            cr16.add_to_env(env)
+        except Exception:
+            from ir_support import CylindricalDHRobotPlot
+            CylindricalDHRobotPlot(cr16).add_to_env(env)
+        env.step(0.02)
+
+    env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
+    env.step(0.02)
+    print("[Scene] Robots & objects added. Starting CR16 pick-carry-return…")
+
+    # ===================== CR16: pick pot, move, return =====================
+    if cr16 is not None:
+        DT = 1/60
+        SPEED_SEC = 2.0  # seconds per segment
+
+        # Pot world pose & a "tool-down" orientation
+        px, py, pz = T_as_SE3(pot.T).t
+        R_down = SE3.Rx(math.pi)
+
+        # Waypoints (world)
+        T_hover  = SE3(px, py, pz + 0.22) * R_down   # hover above pot
+        T_touch  = SE3(px, py, pz + 0.08) * R_down   # just over the rim
+        T_carry1 = SE3(px + 0.30, py, pz + 0.22) * R_down  # sideways carry target
+        T_homeH  = T_hover                            # back to hover (original)
+
+        # Solve IK chain
+        q_now = cr16.q.copy()
+
+        q_hover, ok = ik_any(cr16, T_hover, q_now);  assert ok, "IK hover failed"
+        q_touch, ok = ik_any(cr16, T_touch, q_hover); assert ok, "IK touch failed"
+        q_carry, ok = ik_any(cr16, T_carry1, q_touch); assert ok, "IK carry failed"
+        q_backH, ok = ik_any(cr16, T_homeH, q_carry);  assert ok, "IK back hover failed"
+
+        # --- 1) Move to hover
+        go_jtraj(cr16, env, cr16.q.copy(), q_hover, SPEED_SEC, DT, banner=banner,
+                 env_V=V_all, env_F=F_all, env_N=N_all, name="CR16")
+
+        # --- 2) Descend to touch
+        go_jtraj(cr16, env, q_hover, q_touch, SPEED_SEC, DT, banner=banner,
+                 env_V=V_all, env_F=F_all, env_N=N_all, name="CR16")
+
+        # Attach: fixed transform tool->pot
+        T_tool_to_pot = attach_tool_fixed(cr16.fkine(cr16.q), pot.T)
+
+        # Carry update callback: pot follows the tool
+        def carry_follow(_qk):
+            set_pose(pot, cr16.fkine(cr16.q) * T_tool_to_pot)
+
+        # --- 3) Carry sideways (pot follows)
+        go_jtraj(cr16, env, q_touch, q_carry, SPEED_SEC, DT, on_step=carry_follow, banner=banner,
+                 env_V=V_all, env_F=F_all, env_N=N_all, name="CR16")
+
+        # --- 4) Return to original hover (pot still follows)
+        go_jtraj(cr16, env, q_carry, q_backH, SPEED_SEC, DT, on_step=carry_follow, banner=banner,
+                 env_V=V_all, env_F=F_all, env_N=N_all, name="CR16")
+
+        # (Optional) keep the pot at the returned hover (still “attached” here)
+        # To “release”, just stop calling carry_follow and leave pot where it is.
+
+        print("[CR16] Move complete. Pot returned with the robot.")
+
+    print("Open Swift at http://127.0.0.1:52100")
+    env.hold()
+
+
+if __name__ == "__main__":
+    main()
