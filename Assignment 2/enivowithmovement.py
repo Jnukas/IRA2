@@ -478,48 +478,48 @@ def main():
     print("="*70 + "\n")
 
     # -------------------------
-    # UR3 Movement to Tray
+    # UR3 Movement to Beef
     # -------------------------
     interpolation = 2           # 1 = Quintic Polynomial, 2 = Trapezoidal Velocity
     steps = 50                  # Specify no. of steps
     
-    # Get tray position
-    tray_x, tray_y = POSITIONS["FRUIT_VEG"]
-    tray_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    # Get beef position
+    beef_x, beef_y = POSITIONS["BEEF"]
+    beef_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
     
     # Define end-effector pose as a 4x4 Homogeneous Transformation Matrix
     # Use SE3 to create translation and rotation (vertical gripper pointing down)
-    T_tray = SE3(tray_x, tray_y, tray_z) @ SE3.Rx(math.pi)
+    T_beef = SE3(beef_x, beef_y, beef_z) @ SE3.Rx(math.pi)
     
     # Get current joint configuration
     q_current = ur3.q.copy()
     
     # Solve inverse kinematics to get required joint angles
-    print("\n[UR3] Calculating inverse kinematics for tray position...")
-    sol = ur3.ikine_LM(T_tray, q0=q_current)
-    q_tray = sol.q
+    print("\n[UR3] Calculating inverse kinematics for beef position...")
+    sol = ur3.ikine_LM(T_beef, q0=q_current)
+    q_beef = sol.q
     
-    # Check if solution is within joint limits
-    q_tray_in_limits = not ur3.islimit(q_tray)
-    print(f"q_tray within joint limits: {q_tray_in_limits}")
-    if not q_tray_in_limits:
-        print(f"Warning: q_tray may be outside limits: {q_tray}")
+    # Check if solution is valid and within joint limits
+    q_beef_in_limits = not ur3.islimit(q_beef)
+    print(f"q_beef within joint limits: {q_beef_in_limits}")
+    if not q_beef_in_limits:
+        print(f"Warning: q_beef may be outside limits: {q_beef}")
     
     # Generate a matrix of interpolated joint angles using chosen method
     if interpolation == 1:
         # Quintic Polynomial
-        q_matrix = rtb.jtraj(q_current, q_tray, steps).q
+        q_matrix = rtb.jtraj(q_current, q_beef, steps).q
     elif interpolation == 2:
         # Trapezoidal Velocity
         from roboticstoolbox import trapezoidal
         s = trapezoidal(0, 1, steps).q                          # Create the scalar function
         q_matrix = np.empty((steps, ur3.n))                     # Create memory allocation
         for i in range(steps):
-            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_tray  # Generate interpolated joint angles
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_beef  # Generate interpolated joint angles
     else:
         raise ValueError("interpolation = 1 for Quintic Polynomial, or 2 for Trapezoidal Velocity")
     
-    print(f"\n[UR3] Moving to tray at ({tray_x:.2f}, {tray_y:.2f}, {tray_z:.2f})...")
+    print(f"\n[UR3] Moving to beef at ({beef_x:.2f}, {beef_y:.2f}, {beef_z:.2f})...")
     print("Press Ctrl+C to stop\n")
     
     # Animate the trajectory
@@ -529,7 +529,68 @@ def main():
         env.step(DT)
         time.sleep(DT)
     
-    print("[UR3] Reached tray position!")
+    print("[UR3] Reached beef position!")
+    print("[UR3] Beef is now attached to end-effector")
+    
+    # -------------------------
+    # Attach beef to UR3 end-effector with offset
+    # -------------------------
+    # Define offset for beef relative to end-effector (in meters)
+    BEEF_OFFSET_X = -0.3
+    BEEF_OFFSET_Y = -0.09
+    BEEF_OFFSET_Z = 0  # 5cm below end-effector
+    
+    # Create offset transformation
+    T_offset = SE3(BEEF_OFFSET_X, BEEF_OFFSET_Y, BEEF_OFFSET_Z)
+    
+    # Now move the beef to follow the UR3 end-effector with offset
+    # Get the current end-effector transform
+    T_ee = ur3.fkine(ur3.q)
+    
+    # Apply offset to end-effector transform
+    beef.T = T_ee @ T_offset
+    env.step(DT)
+    time.sleep(0.5)
+    
+    # -------------------------
+    # Move UR3 to demonstrate beef following
+    # -------------------------
+    print("\n[UR3] Moving to new position with beef attached...")
+    
+    # Define a new target position (move up and to the side)
+    target_x = beef_x + 0.3
+    target_y = beef_y + 0.3
+    target_z = beef_z + 0.2
+    
+    T_target = SE3(target_x, target_y, target_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for new position
+    q_current = ur3.q.copy()
+    sol_target = ur3.ikine_LM(T_target, q0=q_current)
+    q_target = sol_target.q
+    
+    # Generate trajectory
+    if interpolation == 1:
+        q_matrix_move = rtb.jtraj(q_current, q_target, steps).q
+    elif interpolation == 2:
+        s_move = trapezoidal(0, 1, steps).q
+        q_matrix_move = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_move[i, :] = (1 - s_move[i]) * q_current + s_move[i] * q_target
+    
+    # Animate trajectory with beef following (with offset)
+    for i, q in enumerate(q_matrix_move):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # Update beef position to follow end-effector with offset
+        T_ee = ur3.fkine(ur3.q)
+        beef.T = T_ee @ T_offset
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Movement complete - beef followed end-effector with offset!")
 
     env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
     env.hold()
