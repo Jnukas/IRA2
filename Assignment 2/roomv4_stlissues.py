@@ -65,7 +65,7 @@ SCALES = {
     # In millimeters - convert to meters
     "rightwayup.stl": [1.0, 1.0, 1.0],
     "Potwithoutthelid.stl": [0.001, 0.001, 0.001],
-    "jugfixed.stl": [0.001, 0.001, 0.001],
+    "jugfixed.stl": [1.0, 1.0, 1.0],
     "Fruit_and_Vegetables_Tray.stl": [0.001, 0.001, 0.001],
     
     # In centimeters - convert to meters
@@ -78,19 +78,19 @@ SCALES = {
 # =====================================================================
 # Change X, Y positions here (in meters, relative to room center)
 POSITIONS = {
-    # Format: "NAME": (x, y)
+    # Format: "NAME": (x = red, y = green -closer to back wall) 
     "STOVE": (0.0, -2.4),           # Back wall
-    "TABLE1": (-1.5, -2.95),         # First table
-    "TABLE2": (1.5, 0.15),          # Work table (second table)
-    "POT": (-1.75, -0.5),           # On table 1
-    "JUG": (1.20, 0.3),             # On table 2 (1.50 - 0.3)
-    "PEPPER": (1.20, -0.3),         # On table 2 (1.50 - 0.3)
-    "BEEF": (1.50, 0.3),            # On table 2
-    "FRUIT_VEG": (1.50, -0.3),      # On table 2
-    "CHICKEN": (1.80, 0.0),         # On table 2 (1.50 + 0.3)
-    "UR3": (0.4, -1.0),             # LinearUR3 rail position
-    "CR3": (-1.2, 0.45),            # CR3 robot
-    "CR16": (-1.2, -1.0),           # CR16 robot
+    "TABLE1": (-1.4, -2.95),         # First table
+    "TABLE2": (1.4, 0.15),          # Work table (second table = grocery table)
+    "POT": (-1.15, -1),           # On table 1
+    "JUG": (-0.65, 0),             # On table 2 (1.50 - 0.3)
+    "PEPPER": (0.5, -0.3),         # On table 2 (1.50 - 0.3)
+    "BEEF": (0, 0),            # On table 2
+    "FRUIT_VEG": (0.65, -0.5),      # On table 2
+    "CHICKEN": (0, 0),         # On table 2 (1.50 + 0.3)
+    "UR3": (0, -0.5),             # LinearUR3 rail position
+    "CR3": (-1.2, 0),            # CR3 robot
+    "CR16": (-1, -2),           # CR16 robot
 }
 
 # HEIGHT ADJUSTMENTS (in meters)
@@ -98,9 +98,9 @@ POSITIONS = {
 # Start with 0 for all objects, then adjust if they float or sink
 HEIGHT_OFFSETS = {
     # Robots
-    "CR3": 0.0,      # On table 1
-    "CR16": 0.0,     # On table 1
-    "UR3": 0.0,      # On floor
+    "CR3": -0.09,      # On table 1
+    "CR16": -0.09,     # On table 1
+    "UR3": 0,      # On floor
     
     # Tables
     "STOVE": 0.0,    # On floor
@@ -108,7 +108,7 @@ HEIGHT_OFFSETS = {
     "TABLE2": 0.0,   # On floor
     
     # Items on tables
-    "POT": 0.0,      # On table 1
+    "POT": -0.03,      # On table 1
     "JUG": 0.0,      # On table 2
     "PEPPER": 0.0,   # On table 2
     "BEEF": 0.0,     # On table 2
@@ -379,7 +379,7 @@ def main():
     ur3 = LinearUR3()
     ur3_x, ur3_y = POSITIONS["UR3"]
     RAIL_Z = FLOOR_TOP + SMALL_GAP + HEIGHT_OFFSETS["UR3"]
-    YAW = math.pi / 90
+    YAW = math.pi / 2
 
     ur3.base = SE3(ur3_x, ur3_y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
     ur3.add_to_env(env)
@@ -474,7 +474,24 @@ def main():
     print("   • Edit HEIGHT_OFFSETS dictionary for Z adjustments")
     print("="*70 + "\n")
 
-    # -------------------------
+    def can_reach(robot, x, y, z, qseed=None):
+    # vertical tool (downward Z): Rx(pi) keeps wrist vertical
+        T_goal = SE3(x, y, z) @ SE3.Rx(math.pi)
+        try:
+            sol = robot.ikine_LM(T_goal, q0=(qseed if qseed is not None else robot.q))
+            ok = bool(sol.success) and not robot.islimit(sol.q)
+            return ok, sol
+        except Exception:
+            return False, None
+
+    x_p, y_p = POSITIONS["POT"]
+    z_pick = table_top_z + 0.12   # ~12 cm above the table for approach
+
+    ok_cr3, _  = can_reach(cr3,  x_p, y_p, z_pick)
+    ok_cr16, _ = can_reach(cr16, x_p, y_p, z_pick)
+    print(f"[reach] CR3={ok_cr3}  CR16={ok_cr16}  at POT=({x_p:.2f},{y_p:.2f},{z_pick:.2f})")
+
+        # -------------------------
     # Phase 2: Motion (unchanged logic)
     # -------------------------
     q = ur3.q.copy()
