@@ -98,8 +98,8 @@ POSITIONS = {
 # Start with 0 for all objects, then adjust if they float or sink
 HEIGHT_OFFSETS = {
     # Robots
-    "CR3": -0.09,      # On table 1
-    "CR16": -0.09,     # On table 1
+    "CR3": -0.08,      # On table 1
+    "CR16": -0.08,     # On table 1
     "UR3": 0,      # On floor
     
     # Tables
