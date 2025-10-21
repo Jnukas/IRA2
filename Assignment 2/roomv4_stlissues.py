@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# room_only_fixed.py — Z-positioning consistency fixes
+# room_only_fixed.py — Z-positioning consistency fixes with FULL CONTROL
 from __future__ import annotations
 
 from pathlib import Path
@@ -58,13 +58,13 @@ def mesh_bounds_info(path: Path, scale_vec):
 # ===== VERIFIED SCALES (Based on YOUR actual STL verification output) =====
 SCALES = {
     # Already in meters - no conversion needed
-    "Stove.stl": [1.0, 1.0, 1.0],  # ✅ YOUR file is already in meters
-    "table.stl": [1.0, 1.0, 1.0],  # ✅ YOUR file is already in meters
-    "pepper_grinder.stl": [1.0, 1.0, 1.0],  # ✅ YOUR file is already in meters
+    "Stove.stl": [1.0, 1.0, 1.0],
+    "table.stl": [1.0, 1.0, 1.0],
+    "pepper_grinder.stl": [1.0, 1.0, 1.0],
     
     # In millimeters - convert to meters
     "rightwayup.stl": [1.0, 1.0, 1.0],
-    "Potwithoutthelid.stl": [0.001, 0.001, 0.001],  # ✅ FIXED from [0.002, 0.002, 0.002]
+    "Potwithoutthelid.stl": [0.001, 0.001, 0.001],
     "jugfixed.stl": [0.001, 0.001, 0.001],
     "Fruit_and_Vegetables_Tray.stl": [0.001, 0.001, 0.001],
     
@@ -73,14 +73,47 @@ SCALES = {
     "chicken.stl": [0.01, 0.01, 0.01],
 }
 
-# ===== HEIGHT ADJUSTMENTS =====
-# If objects are floating or buried, adjust these offsets (in meters)
-# Negative values = lower the object, Positive values = raise the object
-# Your table is now 1.05m tall, so offsets should be near 0
+# =====================================================================
+# POSITION CONTROL CENTER
+# =====================================================================
+# Change X, Y positions here (in meters, relative to room center)
+POSITIONS = {
+    # Format: "NAME": (x, y)
+    "STOVE": (0.0, -2.4),           # Back wall
+    "TABLE1": (-1.5, -2.95),         # First table
+    "TABLE2": (1.5, 0.15),          # Work table (second table)
+    "POT": (-1.75, -0.5),           # On table 1
+    "JUG": (1.20, 0.3),             # On table 2 (1.50 - 0.3)
+    "PEPPER": (1.20, -0.3),         # On table 2 (1.50 - 0.3)
+    "BEEF": (1.50, 0.3),            # On table 2
+    "FRUIT_VEG": (1.50, -0.3),      # On table 2
+    "CHICKEN": (1.80, 0.0),         # On table 2 (1.50 + 0.3)
+    "UR3": (0.4, -1.0),             # LinearUR3 rail position
+    "CR3": (-1.2, 0.45),            # CR3 robot
+    "CR16": (-1.2, -1.0),           # CR16 robot
+}
+
+# HEIGHT ADJUSTMENTS (in meters)
+# Negative = lower, Positive = raise
+# Start with 0 for all objects, then adjust if they float or sink
 HEIGHT_OFFSETS = {
-    "CR3": 0,   # Adjust if CR3 floats or sinks into table (start with 0)
-    "CR16": 0, # Adjust if CR16 floats or sinks into table (start with 0)
-    "POT": 0,  # Adjust if pot floats or sinks into table (start with 0)
+    # Robots
+    "CR3": 0.0,      # On table 1
+    "CR16": 0.0,     # On table 1
+    "UR3": 0.0,      # On floor
+    
+    # Tables
+    "STOVE": 0.0,    # On floor
+    "TABLE1": 0.0,   # On floor
+    "TABLE2": 0.0,   # On floor
+    
+    # Items on tables
+    "POT": 0.0,      # On table 1
+    "JUG": 0.0,      # On table 2
+    "PEPPER": 0.0,   # On table 2
+    "BEEF": 0.0,     # On table 2
+    "FRUIT_VEG": 0.0,  # On table 2
+    "CHICKEN": 0.0,  # On table 2
 }
 
 # ===== Motion toggles =====
@@ -227,14 +260,14 @@ def main():
     # -------------------------
     # Helper: Add mesh with consistent Z positioning
     # -------------------------
-    def add_mesh(filename: str, x: float, y: float, rotation_z: float = 0.0,
+    def add_mesh(obj_name: str, filename: str, rotation_z: float = 0.0,
                  z_base: float = FLOOR_TOP, color=None, extra_rotation=None):
         """
-        Add a mesh with automatic Z positioning.
+        Add a mesh with automatic Z positioning and named height offset.
         
         Args:
+            obj_name: Name key for POSITIONS and HEIGHT_OFFSETS lookups
             filename: STL filename (looked up in SCALES dict)
-            x, y: Horizontal position
             rotation_z: Rotation around Z axis (radians)
             z_base: Base height (default: FLOOR_TOP for floor-level objects)
             color: RGBA color list
@@ -243,17 +276,20 @@ def main():
         Returns:
             (mesh_object, top_z) where top_z is the height of the top surface
         """
+        x, y = POSITIONS.get(obj_name, (0.0, 0.0))
+        height_offset = HEIGHT_OFFSETS.get(obj_name, 0.0)
+        
         path = Path(__file__).parent / "assets" / filename
         scale = SCALES.get(filename, [1.0, 1.0, 1.0])
         
         z_lift, size_m = mesh_bounds_info(path, scale)
         
         if size_m is not None:
-            print(f"{filename:30s} size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
-            top_z = z_base + z_lift + float(size_m[2])
+            print(f"{obj_name:15s} {filename:30s} size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+            top_z = z_base + z_lift + float(size_m[2]) + height_offset
         else:
-            print(f"{filename:30s} [trimesh unavailable, using z_lift only]")
-            top_z = z_base + z_lift
+            print(f"{obj_name:15s} {filename:30s} [trimesh unavailable]")
+            top_z = z_base + z_lift + height_offset
         
         mesh = sg.Mesh(
             filename=str(path),
@@ -262,7 +298,7 @@ def main():
         )
         
         # Build transformation: translate to position, then rotate
-        T = SE3(x, y, z_base + z_lift) @ SE3.Rz(rotation_z)
+        T = SE3(x, y, z_base + z_lift + height_offset) @ SE3.Rz(rotation_z)
         if extra_rotation is not None:
             T = T @ extra_rotation
         
@@ -272,88 +308,68 @@ def main():
         return mesh, top_z
 
     # -------------------------
-    # Add all objects with consistent positioning
+    # Add all objects with named positioning
     # -------------------------
     
-    # Stove (back wall)
+    SMALL_GAP = 0.003  # Small gap to prevent Z-fighting
+    
+    # Floor objects
     stove, _ = add_mesh(
-        "Stove.stl",
-        x=0.0,
-        y=-ROOM_D / 2 + 0.60,
+        "STOVE", "Stove.stl",
         rotation_z=math.pi,
         color=[0.70, 0.70, 0.70, 1.0]
     )
 
-    # First table
     table, table_top_z = add_mesh(
-        "table.stl",
-        x=-1.5,
-        y=-0.5,
+        "TABLE1", "table.stl",
         rotation_z=math.pi / 2,
         color=[0.50, 0.50, 0.50, 1.0]
     )
     print(f"✓ Table 1 top surface at Z = {table_top_z:.4f} m")
 
-    # Pot on first table
-    SMALL_GAP = 0.003  # Small gap to prevent Z-fighting
-    pot, _ = add_mesh(
-        "Potwithoutthelid.stl",
-        x=-1.75,
-        y=-0.5,
-        z_base=table_top_z + SMALL_GAP + HEIGHT_OFFSETS["POT"],  # With manual offset
-        color=[1.0, 0.0, 0.0, 1.0]
-    )
-    print(f"✓ Pot positioned at Z = {table_top_z + SMALL_GAP + HEIGHT_OFFSETS['POT']:.4f} m")
-
-    # Second table (work table)
     work_table, table2_top_z = add_mesh(
-        "rightwayup.stl",
-        x=1.50,
-        y=0.0,
+        "TABLE2", "rightwayup.stl",
         rotation_z=0.0,
         extra_rotation=SE3.RPY([-90, 0, 0], order='xyz', unit='deg'),
         color=[0.50, 0.50, 0.50, 1.0]
     )
     print(f"✓ Table 2 top surface at Z = {table2_top_z:.4f} m")
 
-    # Items on second table
-    def add_table2_item(filename, x_offset, y_offset, color, rotation=0.0):
-        return add_mesh(
-            filename,
-            x=1.50 + x_offset,
-            y=y_offset,
-            rotation_z=rotation,
-            z_base=table2_top_z + SMALL_GAP,
-            color=color
-        )
+    # Objects on table 1
+    pot, _ = add_mesh(
+        "POT", "Potwithoutthelid.stl",
+        z_base=table_top_z + SMALL_GAP,
+        color=[1.0, 0.0, 0.0, 1.0]
+    )
 
-    jug, _ = add_table2_item(
-        "jugfixed.stl",
-        x_offset=-0.3, y_offset=0.3,
+    # Objects on table 2
+    jug, _ = add_mesh(
+        "JUG", "jugfixed.stl",
+        z_base=table2_top_z + SMALL_GAP,
         color=[0.8, 0.9, 1.0, 1.0]
     )
 
-    pepper_grinder, _ = add_table2_item(
-        "pepper_grinder.stl",
-        x_offset=-0.3, y_offset=-0.3,
+    pepper_grinder, _ = add_mesh(
+        "PEPPER", "pepper_grinder.stl",
+        z_base=table2_top_z + SMALL_GAP,
         color=[0.2, 0.2, 0.2, 1.0]
     )
 
-    beef, _ = add_table2_item(
-        "beef.stl",
-        x_offset=0.0, y_offset=0.3,
+    beef, _ = add_mesh(
+        "BEEF", "beef.stl",
+        z_base=table2_top_z + SMALL_GAP,
         color=[0.8, 0.3, 0.3, 1.0]
     )
 
-    fruit_veg_tray, _ = add_table2_item(
-        "Fruit_and_Vegetables_Tray.stl",
-        x_offset=0.0, y_offset=-0.3,
+    fruit_veg_tray, _ = add_mesh(
+        "FRUIT_VEG", "Fruit_and_Vegetables_Tray.stl",
+        z_base=table2_top_z + SMALL_GAP,
         color=[0.4, 0.7, 0.3, 1.0]
     )
 
-    chicken, _ = add_table2_item(
-        "chicken.stl",
-        x_offset=0.3, y_offset=0.0,
+    chicken, _ = add_mesh(
+        "CHICKEN", "chicken.stl",
+        z_base=table2_top_z + SMALL_GAP,
         color=[1.0, 0.9, 0.7, 1.0]
     )
 
@@ -361,29 +377,29 @@ def main():
     # Linear UR3 on rail
     # -------------------------
     ur3 = LinearUR3()
-    RAIL_X0 = 0.4
-    RAIL_Y  = -1
-    RAIL_Z  = FLOOR_TOP + SMALL_GAP
-    YAW     = math.pi / 90
+    ur3_x, ur3_y = POSITIONS["UR3"]
+    RAIL_Z = FLOOR_TOP + SMALL_GAP + HEIGHT_OFFSETS["UR3"]
+    YAW = math.pi / 90
 
-    ur3.base = SE3(RAIL_X0, RAIL_Y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
+    ur3.base = SE3(ur3_x, ur3_y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
     ur3.add_to_env(env)
+    print(f"✓ UR3 base at Z = {RAIL_Z:.4f} m")
 
     # -------------------------
-    # CR3 — WITH ADJUSTABLE HEIGHT OFFSET
+    # CR3 Robot
     # -------------------------
     CR3_FILE = Path(__file__).parent / "Cr3UR3editon.py"
     CR3Class = _load_robot_class(CR3_FILE, ("CR3", "Cr3UR3editon", "DobotCR3", "RobotCR3"))
     cr3 = CR3Class()
 
-    CR3_X, CR3_Y = -1.2, 0.45
-    CR3_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR3"]  # With manual offset
+    cr3_x, cr3_y = POSITIONS["CR3"]
+    CR3_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR3"]
     CR3_YAW = -math.pi / 2
     
-    print(f"✓ CR3 base at Z = {CR3_Z:.4f} m (table_top={table_top_z:.4f}, offset={HEIGHT_OFFSETS['CR3']})")
+    print(f"✓ CR3 base at Z = {CR3_Z:.4f} m (offset={HEIGHT_OFFSETS['CR3']:.4f})")
 
     base0_cr3 = getattr(cr3, "base", SE3())
-    cr3.base = SE3(CR3_X, CR3_Y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0_cr3
+    cr3.base = SE3(cr3_x, cr3_y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0_cr3
 
     try:
         q_spawn = cr3.q.copy()
@@ -400,7 +416,7 @@ def main():
     env.step(0.02)
 
     # -------------------------
-    # CR16 — WITH ADJUSTABLE HEIGHT OFFSET
+    # CR16 Robot
     # -------------------------
     CR16_FILE = Path(__file__).parent / "CR16Creator.py"
     try:
@@ -414,14 +430,14 @@ def main():
         cr16 = None
 
     if cr16 is not None:
-        CR16_X, CR16_Y = -1.2, -1.0
-        CR16_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR16"]  # With manual offset
+        cr16_x, cr16_y = POSITIONS["CR16"]
+        CR16_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR16"]
         CR16_YAW = +math.pi / 2
         
-        print(f"✓ CR16 base at Z = {CR16_Z:.4f} m (table_top={table_top_z:.4f}, offset={HEIGHT_OFFSETS['CR16']})")
+        print(f"✓ CR16 base at Z = {CR16_Z:.4f} m (offset={HEIGHT_OFFSETS['CR16']:.4f})")
 
         base0_cr16 = getattr(cr16, "base", SE3())
-        cr16.base = SE3(CR16_X, CR16_Y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0_cr16
+        cr16.base = SE3(cr16_x, cr16_y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0_cr16
 
         try:
             if hasattr(cr16, "q_home"):
@@ -445,20 +461,18 @@ def main():
             print("[CR16] Visual add failed:", e)
 
     # -------------------------
-    # Phase 1 complete
+    # Scene Summary
     # -------------------------
     env.step(0.02)
-    print("\n" + "="*60)
-    print("[Scene] All objects positioned with adjustable offsets")
+    print("\n" + "="*70)
+    print("[Scene] All objects positioned with full control")
     print(f"  FLOOR_TOP = {FLOOR_TOP:.4f} m")
     print(f"  Table 1 top = {table_top_z:.4f} m")
     print(f"  Table 2 top = {table2_top_z:.4f} m")
-    print(f"  CR3 base = {CR3_Z:.4f} m (offset: {HEIGHT_OFFSETS['CR3']} m)")
-    if cr16:
-        print(f"  CR16 base = {CR16_Z:.4f} m (offset: {HEIGHT_OFFSETS['CR16']} m)")
-    print(f"  Pot base = {table_top_z + SMALL_GAP + HEIGHT_OFFSETS['POT']:.4f} m (offset: {HEIGHT_OFFSETS['POT']} m)")
-    print("\n💡 TIP: Adjust HEIGHT_OFFSETS at top of file if objects float/sink")
-    print("="*60 + "\n")
+    print("\n💡 To reposition objects:")
+    print("   • Edit POSITIONS dictionary for X,Y coordinates")
+    print("   • Edit HEIGHT_OFFSETS dictionary for Z adjustments")
+    print("="*70 + "\n")
 
     # -------------------------
     # Phase 2: Motion (unchanged logic)
@@ -516,7 +530,6 @@ def main():
             time.sleep(DT)
 
     env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
-    #print("Open Swift at http://localhost:52100")
     env.hold()
 
 
