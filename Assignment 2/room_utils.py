@@ -24,7 +24,7 @@ def make_room(env,
     floor = sg.Cuboid(
         scale=[room_w, room_d, floor_t],
         pose=SE3(0, 0, floor_top - floor_t/2),
-        color=[0.92, 0.92, 0.92, 1.0]
+        color=[0.95, 0.95, 0.95, 1.0]
     )
     env.add(floor)
 
