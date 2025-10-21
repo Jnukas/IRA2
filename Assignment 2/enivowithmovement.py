@@ -478,66 +478,58 @@ def main():
     print("="*70 + "\n")
 
     # -------------------------
-    # UR3 Movement to Beef
+    # UR3 Movement to Tray
     # -------------------------
     interpolation = 2           # 1 = Quintic Polynomial, 2 = Trapezoidal Velocity
     steps = 50                  # Specify no. of steps
     
-    # Get beef position
-    beef_x, beef_y = POSITIONS["BEEF"]
-    beef_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    # Get tray position
+    tray_x, tray_y = POSITIONS["FRUIT_VEG"]
+    tray_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
     
     # Define end-effector pose as a 4x4 Homogeneous Transformation Matrix
     # Use SE3 to create translation and rotation (vertical gripper pointing down)
-    T_beef = SE3(beef_x, beef_y, beef_z) @ SE3.Rx(math.pi)
+    T_tray = SE3(tray_x, tray_y, tray_z) @ SE3.Rx(math.pi)
     
     # Get current joint configuration
     q_current = ur3.q.copy()
     
     # Solve inverse kinematics to get required joint angles
-    print("\n[UR3] Calculating inverse kinematics for beef position...")
-    sol = ur3.ikine_LM(T_beef, q0=q_current)
-    q_beef = sol.q
+    print("\n[UR3] Calculating inverse kinematics for tray position...")
+    sol = ur3.ikine_LM(T_tray, q0=q_current)
+    q_tray = sol.q
     
-    # Check if solution is valid and within joint limits
-    if not sol.success:
-        print(f"[UR3] ERROR: IK solution failed - no valid joint configuration found for beef position")
-        print(f"       Target position: ({beef_x:.2f}, {beef_y:.2f}, {beef_z:.2f})")
-        print(f"       Robot will NOT move.")
-    elif ur3.islimit(q_beef):
-        print(f"[UR3] ERROR: Joint configuration is OUTSIDE joint limits")
-        print(f"       Target position: ({beef_x:.2f}, {beef_y:.2f}, {beef_z:.2f})")
-        print(f"       Calculated joints: {q_beef}")
-        print(f"       Robot will NOT move.")
+    # Check if solution is within joint limits
+    q_tray_in_limits = not ur3.islimit(q_tray)
+    print(f"q_tray within joint limits: {q_tray_in_limits}")
+    if not q_tray_in_limits:
+        print(f"Warning: q_tray may be outside limits: {q_tray}")
+    
+    # Generate a matrix of interpolated joint angles using chosen method
+    if interpolation == 1:
+        # Quintic Polynomial
+        q_matrix = rtb.jtraj(q_current, q_tray, steps).q
+    elif interpolation == 2:
+        # Trapezoidal Velocity
+        from roboticstoolbox import trapezoidal
+        s = trapezoidal(0, 1, steps).q                          # Create the scalar function
+        q_matrix = np.empty((steps, ur3.n))                     # Create memory allocation
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_tray  # Generate interpolated joint angles
     else:
-        print(f"[UR3] IK solution found and within joint limits")
-        print(f"       Target position: ({beef_x:.2f}, {beef_y:.2f}, {beef_z:.2f})")
-        
-        # Generate a matrix of interpolated joint angles using chosen method
-        if interpolation == 1:
-            # Quintic Polynomial
-            q_matrix = rtb.jtraj(q_current, q_beef, steps).q
-        elif interpolation == 2:
-            # Trapezoidal Velocity
-            from roboticstoolbox import trapezoidal
-            s = trapezoidal(0, 1, steps).q                          # Create the scalar function
-            q_matrix = np.empty((steps, ur3.n))                     # Create memory allocation
-            for i in range(steps):
-                q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_beef  # Generate interpolated joint angles
-        else:
-            raise ValueError("interpolation = 1 for Quintic Polynomial, or 2 for Trapezoidal Velocity")
-        
-        print(f"\n[UR3] Moving to beef...")
-        print("Press Ctrl+C to stop\n")
-        
-        # Animate the trajectory
-        for i, q in enumerate(q_matrix):
-            safety.block_until_allowed(env, DT)
-            ur3.q = q
-            env.step(DT)
-            time.sleep(DT)
-        
-        print("[UR3] Reached beef position!")
+        raise ValueError("interpolation = 1 for Quintic Polynomial, or 2 for Trapezoidal Velocity")
+    
+    print(f"\n[UR3] Moving to tray at ({tray_x:.2f}, {tray_y:.2f}, {tray_z:.2f})...")
+    print("Press Ctrl+C to stop\n")
+    
+    # Animate the trajectory
+    for i, q in enumerate(q_matrix):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Reached tray position!")
 
     env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
     env.hold()
