@@ -598,7 +598,7 @@ def main():
     print("\n[UR3] Releasing beef...")
     
     # Store the final beef position and flip it upright
-    T_beef_final = beef.T @ SE3.Rx(math.pi).A  # Convert SE3 to numpy array before multiplication
+    T_beef_final = beef.T @ SE3.Rx(math.pi).A  # Flip 180 degrees around X to make upright
     
     # -------------------------
     # UR3 Movement to Chicken (directly from beef placement)
@@ -978,6 +978,348 @@ def main():
         time.sleep(DT)
     
     print("[UR3] All tasks complete - beef, chicken, pepper, and jug placed!")
+    
+    # -------------------------
+    # CR3 Movement to Beef
+    # -------------------------
+    print("\n[CR3] Starting pick-and-place sequence...")
+    print("[CR3] Moving to beef...")
+    
+    # Get beef final position (where UR3 placed it)
+    beef_pickup_x = -beef_x - 0.2
+    beef_pickup_y = beef_y
+    beef_pickup_z = beef_z + 0.05 + 0.15  # Add extra height for approach
+    
+    # Define end-effector pose for beef pickup
+    T_beef_pickup = SE3(beef_pickup_x, beef_pickup_y, beef_pickup_z) @ SE3.Rx(math.pi)
+    
+    # Get current CR3 joint configuration
+    q_current_cr3 = cr3.q.copy()
+    
+    # Solve inverse kinematics for beef pickup position
+    print("[CR3] Calculating IK for beef pickup...")
+    sol_cr3 = cr3.ikine_LM(T_beef_pickup, q0=q_current_cr3)
+    q_beef_pickup = sol_cr3.q
+    
+    # Generate trajectory to beef
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_beef_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_beef_pickup
+    
+    # Animate trajectory to beef
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Reached beef position!")
+    
+    # Attach beef to CR3 with offset
+    CR3_OFFSET_X = 0.0
+    CR3_OFFSET_Y = 0.0
+    CR3_OFFSET_Z = -0.05
+    T_offset_cr3 = SE3(CR3_OFFSET_X, CR3_OFFSET_Y, CR3_OFFSET_Z)
+    
+    # Get pot position for placement
+    pot_x, pot_y = POSITIONS["POT"]
+    pot_z = TABLE_HEIGHT + 0.2  # Above the pot
+    
+    # Move beef to pot
+    print("[CR3] Moving beef to pot...")
+    T_pot = SE3(pot_x, pot_y, pot_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    # Generate trajectory to pot
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    # Animate trajectory with beef following
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        
+        # Update beef to follow CR3
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        beef.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A  # Keep upright
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Beef placed in pot!")
+    # Release beef in pot
+    beef.T = SE3(pot_x, pot_y, pot_z - 0.1).A  # Drop into pot
+    
+    # -------------------------
+    # CR3 Movement to Chicken
+    # -------------------------
+    print("[CR3] Moving to chicken...")
+    
+    chicken_pickup_x = -chicken_x - 0.2
+    chicken_pickup_y = chicken_y
+    chicken_pickup_z = chicken_z + 0.05 + 0.15
+    
+    T_chicken_pickup = SE3(chicken_pickup_x, chicken_pickup_y, chicken_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_chicken = cr3.ikine_LM(T_chicken_pickup, q0=q_current_cr3)
+    q_chicken_pickup = sol_chicken.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_chicken_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_chicken_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving chicken to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        chicken.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Chicken placed in pot!")
+    chicken.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    # -------------------------
+    # CR3 Movement to Pepper
+    # -------------------------
+    print("[CR3] Moving to pepper...")
+    
+    pepper_pickup_x = -pepper_x - 0.2
+    pepper_pickup_y = pepper_y
+    pepper_pickup_z = pepper_z + 0.05 + 0.15
+    
+    T_pepper_pickup = SE3(pepper_pickup_x, pepper_pickup_y, pepper_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pepper = cr3.ikine_LM(T_pepper_pickup, q0=q_current_cr3)
+    q_pepper_pickup = sol_pepper.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_pepper_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_pepper_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving pepper to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        pepper_grinder.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Pepper placed in pot!")
+    pepper_grinder.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    # -------------------------
+    # CR3 Movement to Jug
+    # -------------------------
+    print("[CR3] Moving to jug...")
+    
+    jug_pickup_x = -jug_x - 0.2
+    jug_pickup_y = jug_y
+    jug_pickup_z = jug_z + 0.05 + 0.15
+    
+    T_jug_pickup = SE3(jug_pickup_x, jug_pickup_y, jug_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_jug = cr3.ikine_LM(T_jug_pickup, q0=q_current_cr3)
+    q_jug_pickup = sol_jug.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_jug_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_jug_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving jug to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        jug.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Jug placed in pot!")
+    jug.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    print("[CR3] All ingredients placed in pot - cooking complete!")
+    
+    # -------------------------
+    # CR16 Movement to Pot
+    # -------------------------
+    print("\n[CR16] Starting pot transfer to stove...")
+    print("[CR16] Moving to pot...")
+    
+    # Get pot position
+    pot_x, pot_y = POSITIONS["POT"]
+    pot_z = TABLE_HEIGHT + 0.2  # Approach from above
+    
+    # Define end-effector pose for pot pickup
+    T_pot_pickup = SE3(pot_x, pot_y, pot_z) @ SE3.Rx(math.pi)
+    
+    # Get current CR16 joint configuration
+    q_current_cr16 = cr16.q.copy()
+    
+    # Solve inverse kinematics for pot pickup position
+    print("[CR16] Calculating IK for pot pickup...")
+    sol_cr16 = cr16.ikine_LM(T_pot_pickup, q0=q_current_cr16)
+    q_pot_pickup = sol_cr16.q
+    
+    # Generate trajectory to pot
+    if interpolation == 1:
+        q_matrix_cr16 = rtb.jtraj(q_current_cr16, q_pot_pickup, steps).q
+    elif interpolation == 2:
+        s_cr16 = trapezoidal(0, 1, steps).q
+        q_matrix_cr16 = np.empty((steps, cr16.n))
+        for i in range(steps):
+            q_matrix_cr16[i, :] = (1 - s_cr16[i]) * q_current_cr16 + s_cr16[i] * q_pot_pickup
+    
+    # Animate trajectory to pot
+    for i, q in enumerate(q_matrix_cr16):
+        safety.block_until_allowed(env, DT)
+        cr16.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR16] Reached pot position!")
+    
+    # Attach pot to CR16 with offset
+    CR16_OFFSET_X = 0.0
+    CR16_OFFSET_Y = 0.0
+    CR16_OFFSET_Z = -0.05
+    T_offset_cr16 = SE3(CR16_OFFSET_X, CR16_OFFSET_Y, CR16_OFFSET_Z)
+    
+    # Get stove position for placement
+    stove_x, stove_y = POSITIONS["STOVE"]
+    stove_z = FLOOR_TOP + 0.9  # On top of the stove
+    
+    # Move pot to stove
+    print("[CR16] Moving pot to stove...")
+    T_stove = SE3(stove_x, stove_y, stove_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr16 = cr16.q.copy()
+    sol_stove = cr16.ikine_LM(T_stove, q0=q_current_cr16)
+    q_stove = sol_stove.q
+    
+    # Generate trajectory to stove
+    if interpolation == 1:
+        q_matrix_to_stove = rtb.jtraj(q_current_cr16, q_stove, steps).q
+    elif interpolation == 2:
+        s_stove = trapezoidal(0, 1, steps).q
+        q_matrix_to_stove = np.empty((steps, cr16.n))
+        for i in range(steps):
+            q_matrix_to_stove[i, :] = (1 - s_stove[i]) * q_current_cr16 + s_stove[i] * q_stove
+    
+    # Animate trajectory with pot following
+    for i, q in enumerate(q_matrix_to_stove):
+        safety.block_until_allowed(env, DT)
+        cr16.q = q
+        
+        # Update pot to follow CR16
+        T_ee_cr16 = cr16.fkine(cr16.q)
+        pot.T = (T_ee_cr16 @ T_offset_cr16).A
+        
+        # All ingredients stay in the pot (move with it)
+        beef.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        chicken.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        pepper_grinder.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        jug.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR16] Pot placed on stove!")
+    
+    # Release pot on stove
+    pot.T = SE3(stove_x, stove_y, stove_z - 0.05).A
+    beef.T = SE3(stove_x, stove_y, stove_z - 0.15).A
+    chicken.T = SE3(stove_x, stove_y, stove_z - 0.15).A
+    pepper_grinder.T = SE3(stove_x, stove_y, stove_z - 0.15).A
+    jug.T = SE3(stove_x, stove_y, stove_z - 0.15).A
+    
+    print("[CR16] Pot transfer complete - ready to cook!")
 
     env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
     env.hold()
