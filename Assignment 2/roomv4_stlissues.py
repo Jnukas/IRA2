@@ -98,8 +98,8 @@ POSITIONS = {
 # Start with 0 for all objects, then adjust if they float or sink
 HEIGHT_OFFSETS = {
     # Robots
-    "CR3": -0.08,      # On table 1
-    "CR16": -0.08,     # On table 1
+    "CR3": -0.02,      # On table 1
+    "CR16": -0.02,     # On table 1
     "UR3": 0,      # On floor
     
     # Tables
@@ -108,12 +108,12 @@ HEIGHT_OFFSETS = {
     "TABLE2": 0.0,   # On floor
     
     # Items on tables
-    "POT": -0.03,      # On table 1
-    "JUG": 0.0,      # On table 2
-    "PEPPER": 0.0,   # On table 2
-    "BEEF": 0.0,     # On table 2
-    "FRUIT_VEG": 0.0,  # On table 2
-    "CHICKEN": 0.0,  # On table 2
+    "POT": -0.02,      # On table 1
+    "JUG": -0.02,      # On table 2
+    "PEPPER": -0.02,   # On table 2
+    "BEEF": -0.02,     # On table 2
+    "FRUIT_VEG": -0.02,  # On table 2
+    "CHICKEN": -0.02,  # On table 2
 }
 
 # ===== Motion toggles =====
