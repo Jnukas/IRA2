@@ -1,71 +1,189 @@
 #!/usr/bin/env python3
-# cr3_swift_collision_rrt.py  (robust Cuboid mesh extraction)
+# cr16_swift_capsules_collision_rrt.py (fixed cuboid scale handling)
+#
+# - Swift UI + Teach sliders (live XYZ/RPY)
+# - Self-collision via per-link CAPSULES (configurable radii)
+# - Env collision against a yellow cube (segment vs. faces)
+# - Button to "Plan & Go" using joint-space RRT with collision checks
+# - Trajectory execution via rtb.jtraj (smooth LSPB blend)
+
 import time
 import numpy as np
 from math import pi
-from itertools import combinations
-
 import swift
-import spatialgeometry as sg
 from spatialmath import SE3
 from spatialmath.base import tr2rpy
+import spatialgeometry as sg
 import roboticstoolbox as rtb
 
-# --- YOUR ROBOT ---
+# ---- your CR16 robot class ----
 from CR16Creator import CR16
 
-# ---------- small helpers ----------
-def T_translation(T_like):
-    """Return (x,y,z) from an SE3 or a 4x4 ndarray."""
-    try:
-        t = T_like.t
-        return float(t[0]), float(t[1]), float(t[2])
-    except Exception:
-        M = np.asarray(T_like)
-        return float(M[0, 3]), float(M[1, 3]), float(M[2, 3])
+
+# ====================== USER KNOBS ======================
+# Target relative to the obstacle (a yellow cube):
+TARGET_OFFSET_X = -0.30   # meters (x wrt cube center)
+TARGET_OFFSET_Y = +0.30   # meters (y wrt cube center)
+TARGET_OFFSET_Z = +0.22   # meters (z wrt cube center)
+TARGET_RPY_DEG  = (180.0, 0.0, 0.0)  # tool Z-down
+
+# Capsule radii per link (m): auto padded/truncated to link count
+CAPSULE_RADII = [0.07, 0.06, 0.06, 0.05, 0.045, 0.040]
+CAPSULE_MARGIN = 0.003   # small inflation (m)
+SKIP_ADJACENT  = True    # ignore touching neighbors at the joint
+
+# RRT parameters
+RRT_MAX_NODES  = 2500
+RRT_STEP       = 0.20    # step in joint space (rad)
+RRT_GOAL_THR   = 0.18    # goal capture distance (rad)
+RRT_GOAL_BIAS  = 0.12
+
+DT = 0.02  # ~50 Hz UI
+# =======================================================
+
+
+# ---------- kinematics helpers ----------
+def get_joint_points(robot, q=None):
+    """
+    Returns world joint origins for each link end (N+1 points).
+    Index 0 is base origin; segment i is between points[i] and points[i+1].
+    """
+    if q is None:
+        q = robot.q
+    T_all = robot.fkine_all(q)  # iterable of SE3 to each link end
+    pts = [robot.base.t.tolist()]
+    for T in T_all:
+        pts.append(T.t.tolist())
+    return np.asarray(pts, float)  # shape (N+1, 3)
+
+
+def segment_segment_closest_points(P0, P1, Q0, Q1, eps=1e-9):
+    """
+    Returns (Pc, Qc, dist) closest points on segments P and Q.
+    """
+    P0 = np.asarray(P0, float); P1 = np.asarray(P1, float)
+    Q0 = np.asarray(Q0, float); Q1 = np.asarray(Q1, float)
+
+    u = P1 - P0
+    v = Q1 - Q0
+    w0 = P0 - Q0
+
+    a = np.dot(u, u)
+    b = np.dot(u, v)
+    c = np.dot(v, v)
+    d = np.dot(u, w0)
+    e = np.dot(v, w0)
+
+    denom = a * c - b * b
+    if denom < eps:
+        sc = 0.0
+        tc = (e / c) if c > eps else 0.0
+    else:
+        sc = (b * e - c * d) / denom
+        tc = (a * e - b * d) / denom
+
+    sc = float(np.clip(sc, 0.0, 1.0))
+    tc = float(np.clip(tc, 0.0, 1.0))
+
+    Pc = P0 + sc * u
+    Qc = Q0 + tc * v
+    dist = np.linalg.norm(Pc - Qc)
+    return Pc, Qc, dist
+
+
+# ---------- capsule self-collision ----------
+class CapsuleSelfCollision:
+    """
+    Treat each link segment as a capsule (segment + radius).
+    Collision when centerline distance < r_i + r_j + margin.
+    """
+    def __init__(self, robot, radii, skip_adjacent=True, margin=0.0):
+        self.robot = robot
+        self.user_radii = list(radii)
+        self.skip_adjacent = skip_adjacent
+        self.margin = float(margin)
+
+    def _radii_for_segments(self, nseg: int):
+        if nseg <= 0:
+            return []
+        if len(self.user_radii) == nseg:
+            return self.user_radii
+        if len(self.user_radii) > nseg:
+            return self.user_radii[:nseg]
+        return self.user_radii + [self.user_radii[-1]] * (nseg - len(self.user_radii))
+
+    def check(self, q=None):
+        pts = get_joint_points(self.robot, q)
+        nseg = pts.shape[0] - 1
+        radii = self._radii_for_segments(nseg)
+
+        hits = []
+        for i in range(nseg):
+            P0, P1 = pts[i], pts[i + 1]
+            r_i = float(radii[i])
+            for j in range(i + 1, nseg):
+                if self.skip_adjacent and (j == i or j == i + 1):
+                    continue
+                Q0, Q1 = pts[j], pts[j + 1]
+                r_j = float(radii[j])
+
+                _, _, d = segment_segment_closest_points(P0, P1, Q0, Q1)
+                thresh = r_i + r_j + self.margin
+                if d < thresh:
+                    hits.append({"i": i, "j": j, "dist": d, "thresh": thresh})
+        return (len(hits) > 0), hits
+
 
 # ---------- robust Cuboid → (vertices, faces, normals) ----------
 def cuboid_mesh_data(cuboid: sg.Cuboid):
     """
     Build world-space vertices, face index lists (quads), and face normals
-    for a spatialgeometry.Cuboid, without using .vertices/.faces attributes.
+    for a spatialgeometry.Cuboid. (No ambiguous truth on NumPy arrays.)
     """
-    # size
-    scale = getattr(cuboid, "scale", None)
-    if scale is None:
-        # some versions use .size
-        scale = getattr(cuboid, "size", [1.0, 1.0, 1.0])
-    sx, sy, sz = [float(s) for s in scale]
+    # Get scale/size explicitly (avoid `or` on arrays)
+    scale_attr = getattr(cuboid, "scale", None)
+    if scale_attr is None:
+        scale_attr = getattr(cuboid, "size", None)
+
+    if scale_attr is None:
+        sx, sy, sz = 1.0, 1.0, 1.0
+    else:
+        arr = np.array(scale_attr, dtype=float).reshape(-1)
+        if arr.size == 1:
+            sx = sy = sz = float(arr[0])
+        elif arr.size >= 3:
+            sx, sy, sz = float(arr[0]), float(arr[1]), float(arr[2])
+        else:
+            sx, sy, sz = 1.0, 1.0, 1.0
+
     hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
 
-    # local vertices (centered at origin)
     Vloc = np.array([
         [-hx, -hy, -hz],  # 0
-        [ +hx, -hy, -hz], # 1
-        [ +hx, +hy, -hz], # 2
+        [+hx, -hy, -hz],  # 1
+        [+hx, +hy, -hz],  # 2
         [-hx, +hy, -hz],  # 3
         [-hx, -hy, +hz],  # 4
-        [ +hx, -hy, +hz], # 5
-        [ +hx, +hy, +hz], # 6
+        [+hx, -hy, +hz],  # 5
+        [+hx, +hy, +hz],  # 6
         [-hx, +hy, +hz],  # 7
     ], dtype=float)
 
-    # transform to world using cuboid.T
-    T = cuboid.T if hasattr(cuboid.T, "A") else SE3(cuboid.T)
+    T = cuboid.T
+    if not hasattr(T, "A"):  # not an SE3
+        T = SE3(T)
     R = T.R; t = T.t
     Vworld = (R @ Vloc.T).T + t
 
-    # faces as quads (indices into Vworld)
     faces = [
-        np.array([0, 1, 2, 3], dtype=int),  # bottom (z-)
-        np.array([4, 5, 6, 7], dtype=int),  # top (z+)
+        np.array([0, 1, 2, 3], dtype=int),  # bottom
+        np.array([4, 5, 6, 7], dtype=int),  # top
         np.array([0, 1, 5, 4], dtype=int),  # y-
         np.array([3, 2, 6, 7], dtype=int),  # y+
         np.array([0, 3, 7, 4], dtype=int),  # x-
         np.array([1, 2, 6, 5], dtype=int),  # x+
     ]
 
-    # per-face normals (world)
     normals = []
     for f in faces:
         a, b, c = Vworld[f[0]], Vworld[f[1]], Vworld[f[2]]
@@ -74,11 +192,9 @@ def cuboid_mesh_data(cuboid: sg.Cuboid):
         if n_norm > 1e-12:
             n = n / n_norm
         normals.append(n)
-    normals = np.asarray(normals, float)
+    return Vworld, faces, np.asarray(normals, float)
 
-    return Vworld, faces, normals
 
-# ---------- collision helpers ----------
 def line_plane_intersection(n, p0, l0, l1, eps=1e-9):
     """Intersect segment l0->l1 with plane (n·(X - p0)=0)."""
     u = np.asarray(l1, float) - np.asarray(l0, float)
@@ -92,21 +208,20 @@ def line_plane_intersection(n, p0, l0, l1, eps=1e-9):
     P = np.asarray(l0, float) + sI * u
     return P, True
 
+
 def triangulate_face(face_idx):
-    """Return triangle list from a 3/4/…-gon index list."""
     if len(face_idx) == 3:
         return [tuple(face_idx)]
     if len(face_idx) == 4:
         i0, i1, i2, i3 = face_idx
         return [(i0, i1, i2), (i0, i2, i3)]
-    # generic fan
     out = []
     for k in range(1, len(face_idx)-1):
         out.append((face_idx[0], face_idx[k], face_idx[k+1]))
     return out
 
+
 def point_in_triangle(P, A, B, C, eps=1e-9):
-    """Barycentric point-in-triangle (coplanar)."""
     v0 = C - A
     v1 = B - A
     v2 = P - A
@@ -122,20 +237,12 @@ def point_in_triangle(P, A, B, C, eps=1e-9):
     v = (dot00 * dot12 - dot01 * dot02) / denom
     return (u >= -eps) and (v >= -eps) and (u + v <= 1.0 + eps)
 
-def get_link_points(robot, q=None):
-    """Return Nx3 joint origins (base + each link end) in world."""
-    if q is None:
-        q = robot.q
-    T_all = robot.fkine_all(q)
-    pts = [robot.base.t.tolist()]
-    for T in T_all:
-        pts.append(T.t.tolist())
-    return np.asarray(pts, float)
 
 def check_env_collision(robot, q, vertices, faces, normals):
-    """Segment–triangle collisions for all links vs environment faces."""
-    pts = get_link_points(robot, q)
-    hits = []
+    """
+    Segment–triangle intersection. (No thickness.)
+    """
+    pts = get_joint_points(robot, q)
     for i in range(len(pts) - 1):
         A = pts[i]; B = pts[i+1]
         for fidx, face in enumerate(faces):
@@ -147,57 +254,15 @@ def check_env_collision(robot, q, vertices, faces, normals):
             for tri in triangulate_face(face):
                 Atri, Btri, Ctri = vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]
                 if point_in_triangle(P, Atri, Btri, Ctri):
-                    hits.append(P.tolist())
-                    break
-    return (len(hits) > 0), hits
+                    return True, (i, fidx)
+    return False, None
 
-# ---------- self-collision (coarse) ----------
-def segment_segment_distance(P0, P1, Q0, Q1, eps=1e-9):
-    u = P1 - P0
-    v = Q1 - Q0
-    w0 = P0 - Q0
-    a = np.dot(u, u)
-    b = np.dot(u, v)
-    c = np.dot(v, v)
-    d = np.dot(u, w0)
-    e = np.dot(v, w0)
-    denom = a * c - b * b
-    if denom < eps:
-        sc = 0.0
-        tc = (e / c) if c > eps else 0.0
-    else:
-        sc = (b * e - c * d) / denom
-        tc = (a * e - b * d) / denom
-    sc = np.clip(sc, 0.0, 1.0)
-    tc = np.clip(tc, 0.0, 1.0)
-    dP = w0 + sc * u - tc * v
-    return np.linalg.norm(dP)
 
-def check_self_collision(robot, q, thresh=0.04):
-    pts = get_link_points(robot, q)
-    hit_pairs = []
-    for i in range(len(pts) - 1):
-        P0, P1 = pts[i], pts[i+1]
-        for j in range(i + 2, len(pts) - 1):
-            if j == i or j == i + 1:
-                continue
-            Q0, Q1 = pts[j], pts[j+1]
-            if segment_segment_distance(np.asarray(P0), np.asarray(P1),
-                                        np.asarray(Q0), np.asarray(Q1)) < thresh:
-                hit_pairs.append((i, j))
-    return (len(hit_pairs) > 0), hit_pairs
-
-# ---------- simple RRT ----------
-class Node:
-    __slots__ = ("q", "parent")
-    def __init__(self, q, parent=None):
-        self.q = np.asarray(q, float)
-        self.parent = parent
-
+# ---------- RRT ----------
 def qdist(q1, q2):
     return np.linalg.norm(np.asarray(q1) - np.asarray(q2))
 
-def steer(q_from, q_to, step=0.18):
+def steer(q_from, q_to, step):
     dq = np.asarray(q_to) - np.asarray(q_from)
     nrm = np.linalg.norm(dq)
     if nrm <= step:
@@ -214,40 +279,52 @@ def sample_q(robot):
             q.append(np.random.uniform(-pi, pi))
     return np.asarray(q, float)
 
-def edge_is_collision_free(robot, q_a, q_b, VERT, FACES, NORMS):
-    steps = int(max(2, np.ceil(qdist(q_a, q_b) / 0.09)))
+def edge_is_collision_free(robot, q_a, q_b, env_geom, selfcollider):
+    VERT, FACES, NORMS = env_geom
+    seglen = np.linalg.norm(np.asarray(q_b) - np.asarray(q_a))
+    steps = max(2, int(np.ceil(seglen / (RRT_STEP / 3.0))))
     for lam in np.linspace(0, 1, steps):
         q = (1 - lam) * np.asarray(q_a) + lam * np.asarray(q_b)
-        hit_env, _ = check_env_collision(robot, q, VERT, FACES, NORMS)
-        if hit_env:
+        env_hit, _ = check_env_collision(robot, q, VERT, FACES, NORMS)
+        if env_hit:
             return False
-        hit_self, _ = check_self_collision(robot, q)
-        if hit_self:
+        self_hit, _ = selfcollider.check(q)
+        if self_hit:
             return False
     return True
 
-def rrt_plan(robot, q_start, q_goal, VERT, FACES, NORMS,
-             max_nodes=2000, goal_thresh=0.15, step=0.18, bias=0.12):
+def rrt_plan(robot, q_start, q_goal, env_geom, selfcollider):
+    class Node:
+        __slots__ = ("q", "parent")
+        def __init__(self, q, parent=None):
+            self.q = np.asarray(q, float)
+            self.parent = parent
+
     root = Node(q_start); nodes = [root]
-    for _ in range(max_nodes):
-        q_rand = q_goal if np.random.rand() < bias else sample_q(robot)
+
+    for _ in range(RRT_MAX_NODES):
+        q_rand = q_goal if np.random.rand() < RRT_GOAL_BIAS else sample_q(robot)
         idx = int(np.argmin([qdist(n.q, q_rand) for n in nodes]))
-        q_new = steer(nodes[idx].q, q_rand, step)
-        if edge_is_collision_free(robot, nodes[idx].q, q_new, VERT, FACES, NORMS):
+        q_new = steer(nodes[idx].q, q_rand, RRT_STEP)
+
+        if edge_is_collision_free(robot, nodes[idx].q, q_new, env_geom, selfcollider):
             nn = Node(q_new, parent=nodes[idx]); nodes.append(nn)
-            if qdist(q_new, q_goal) < goal_thresh:
-                if edge_is_collision_free(robot, q_new, q_goal, VERT, FACES, NORMS):
-                    goal_node = Node(q_goal, parent=nn)
+
+            if qdist(q_new, q_goal) < RRT_GOAL_THR:
+                if edge_is_collision_free(robot, q_new, q_goal, env_geom, selfcollider):
+                    goal = Node(q_goal, parent=nn)
+                    # backtrack
                     path = []
-                    cur = goal_node
+                    cur = goal
                     while cur is not None:
                         path.append(cur.q)
                         cur = cur.parent
                     return list(reversed(path))
     return None
 
+
 # ---------- Teach UI ----------
-def teach_mode(robot, env, banner_label, env_geom):
+def teach_mode(robot, env, selfcollider, env_geom):
     VERT, FACES, NORMS = env_geom
 
     def pose_strings():
@@ -266,27 +343,29 @@ def teach_mode(robot, env, banner_label, env_geom):
     label_z = swift.Label(zs); env.add(label_z)
     label_r = swift.Label(rs); env.add(label_r)
     label_p = swift.Label(ps); env.add(label_p)
-    label_yaw = swift.Label(ys2); env.add(label_yaw)
-    labels = [label_x, label_y, label_z, label_r, label_p, label_yaw]
+    label_yw = swift.Label(ys2); env.add(label_yw)
 
-    def update_banner():
+    banner = swift.Label(" "); env.add(banner)
+
+    def update_all():
+        xs, ys, zs, rs, ps, ys2 = pose_strings()
+        label_x.desc, label_y.desc, label_z.desc = xs, ys, zs
+        label_r.desc, label_p.desc, label_yw.desc = rs, ps, ys2
+
         env_hit, _ = check_env_collision(robot, robot.q, VERT, FACES, NORMS)
-        self_hit, _ = check_self_collision(robot, robot.q)
-        banner_label.desc = "⚠️  COLLISION DETECTED  ⚠️" if (env_hit or self_hit) else " "
+        self_hit, _ = selfcollider.check(robot.q)
+        banner.desc = "⚠️  COLLISION DETECTED  ⚠️" if (env_hit or self_hit) else " "
 
     def on_slider(v_deg, j):
         q = list(robot.q)
-        q[j] = np.deg2rad(v_deg)
+        q[j] = float(np.deg2rad(v_deg))
         try:
             qmin, qmax = robot.links[j].qlim
             q[j] = float(np.clip(q[j], qmin, qmax))
         except Exception:
             pass
         robot.q = q
-        xs, ys, zs, rs, ps, ys2 = pose_strings()
-        label_x.desc, label_y.desc, label_z.desc = xs, ys, zs
-        label_r.desc, label_p.desc, label_yaw.desc = rs, ps, ys2
-        update_banner()
+        update_all()
 
     for j in range(robot.n):
         try:
@@ -295,47 +374,60 @@ def teach_mode(robot, env, banner_label, env_geom):
         except Exception:
             mn_deg, mx_deg = -180.0, 180.0
         val_deg = float(np.rad2deg(robot.q[j]))
-        slider = swift.Slider(cb=lambda v, jj=j: on_slider(v, jj),
-                              min=mn_deg, max=mx_deg, step=1.0,
-                              value=np.clip(val_deg, mn_deg, mx_deg),
-                              desc=f"Joint {j+1}", unit='°')
-        env.add(slider)
+        s = swift.Slider(cb=lambda v, jj=j: on_slider(v, jj),
+                         min=mn_deg, max=mx_deg, step=1.0,
+                         value=np.clip(val_deg, mn_deg, mx_deg),
+                         desc=f"Joint {j+1}", unit="°")
+        env.add(s)
 
-    update_banner()
+    update_all()
     env.step(0.02)
+    return banner  # useful if you want to reuse
+
 
 # ---------- Main ----------
 def main():
+    # Swift env
     env = swift.Swift()
     env.launch(realtime=True)
 
+    # CR16
     robot = CR16()
     robot.add_to_env(env)
 
-    env.set_camera_pose(position=[1.8, 1.6, 1.2], look_at=[0, 0, 0.5])
+    # Camera
+    env.set_camera_pose(position=[1.8, 1.6, 1.2], look_at=[0.0, 0.0, 0.5])
 
-    # Obstacle: Cuboid (we'll compute its triangles ourselves)
-    box = sg.Cuboid(scale=[0.40, 0.30, 0.28], color=[0.75, 0.45, 0.45, 1.0])
-    box.T = SE3(0.55, -0.35, 0.14)   # center pose
+    # Yellow obstacle (your “square”)
+    box = sg.Cuboid(scale=[0.35, 0.35, 0.35], color=[0.95, 0.80, 0.20, 1.0])
+    box.T = SE3(0.60, -0.20, 0.25)   # center pose
     env.add(box)
 
-    # Extract world-space mesh data robustly
+    # Build env geometry (static) — FIXED: no ambiguous `or` on arrays
     VERT, FACES, NORMS = cuboid_mesh_data(box)
 
-    # Collision banner
-    banner = swift.Label(" "); env.add(banner)
+    # Self-collision (capsules)
+    selfcollider = CapsuleSelfCollision(robot, CAPSULE_RADII, SKIP_ADJACENT, CAPSULE_MARGIN)
 
-    # Teach UI + live collision
-    teach_mode(robot, env, banner, (VERT, FACES, NORMS))
-
+    # Teach UI + banner
     status = swift.Label("status: idle"); env.add(status)
+    teach_mode(robot, env, selfcollider, (VERT, FACES, NORMS))
 
-    def plan_and_go_cb(_=None):
-        status.desc = "status: planning…"; env.step(0.02)
+    # ----- plan & execute button -----
+    def plan_and_go(_=None):
+        status.desc = "status: IK…"; env.step(0.02)
 
-        bx, by, bz = T_translation(box.T)
-        T_goal = SE3(bx - 0.3, by + 0.3 , bz + 0.22) * SE3.Rx(pi)  # hover near box, tool Z-down
+        # Build target pose near the box
+        t = box.T.t if hasattr(box.T, "t") else SE3(box.T).t
+        bx, by, bz = float(t[0]), float(t[1]), float(t[2])
 
+        tx = bx + TARGET_OFFSET_X
+        ty = by + TARGET_OFFSET_Y
+        tz = bz + TARGET_OFFSET_Z
+        rx, ry, rz = [np.deg2rad(x) for x in TARGET_RPY_DEG]
+        T_goal = SE3(tx, ty, tz) * SE3.Rx(rx) * SE3.Ry(ry) * SE3.Rz(rz)
+
+        # IK with progressively relaxed masks
         seed = robot.q
         sol = robot.ikine_LM(T_goal, q0=seed)
         if not sol.success:
@@ -344,48 +436,54 @@ def main():
             sol = robot.ikine_LM(T_goal, q0=seed, mask=[1,1,1,0,0,0])
 
         if not sol.success:
-            status.desc = "status: IK failed"; return
+            status.desc = "status: IK failed (tweak offsets/orientation)"
+            return
 
         q_goal = sol.q
+
+        # reject goal if in collision
         env_hit, _ = check_env_collision(robot, q_goal, VERT, FACES, NORMS)
-        self_hit, _ = check_self_collision(robot, q_goal)
+        self_hit, _ = selfcollider.check(q_goal)
         if env_hit or self_hit:
-            status.desc = "status: goal in collision (adjust offsets)"; return
+            status.desc = "status: goal in collision (adjust TARGET_* knobs)"
+            return
 
+        # RRT plan
+        status.desc = "status: planning…"; env.step(0.02)
         q_start = robot.q.copy()
-        path = rrt_plan(robot, q_start, q_goal, VERT, FACES, NORMS,
-                        max_nodes=2500, goal_thresh=0.18, step=0.20, bias=0.12)
+        path = rrt_plan(robot, q_start, q_goal, (VERT, FACES, NORMS), selfcollider)
         if path is None:
-            status.desc = "status: RRT failed (tune step/goal)"; return
+            status.desc = "status: RRT failed (tune RRT_* / target)"
+            return
 
-        status.desc = "status: executing…"
+        # Execute with jtraj
+        status.desc = "status: executing…"; env.step(0.02)
         for i in range(len(path) - 1):
             qa, qb = path[i], path[i+1]
             N = max(10, int(np.ceil(np.linalg.norm(qb-qa) / 0.06)))
             Q = rtb.jtraj(qa, qb, N).q
             for qk in Q:
                 robot.q = qk
-                env_hit, _ = check_env_collision(robot, robot.q, VERT, FACES, NORMS)
-                self_hit, _ = check_self_collision(robot, robot.q)
-                banner.desc = "⚠️  COLLISION DETECTED  ⚠️" if (env_hit or self_hit) else " "
-                env.step(0.02)
-                time.sleep(0.02)
+                env.step(DT)
+                time.sleep(DT)
         status.desc = "status: done"
 
-    # Button to trigger the plan (fallback: auto-run once if Button missing)
     try:
-        btn = swift.Button(desc="Plan & Go (avoid box)", cb=plan_and_go_cb)
+        btn = swift.Button(desc="Plan & Go (avoid obstacle)", cb=plan_and_go)
         env.add(btn)
     except Exception:
-        plan_and_go_cb()
+        # If Button isn't available, auto-run once
+        plan_and_go()
 
-    print("• Sliders move the CR3; red banner shows on collision.")
-    print("• Click 'Plan & Go (avoid box)' to plan a collision-free path and execute with jtraj.")
+    print("\n• Move joints with sliders; banner lights on collision.")
+    print("• Click 'Plan & Go (avoid obstacle)' to plan to the target near the box.")
+    print("  Customize TARGET_OFFSET_* and TARGET_RPY_DEG at the top.")
     try:
         while True:
-            env.step(0.02); time.sleep(0.02)
+            env.step(DT); time.sleep(DT)
     except KeyboardInterrupt:
         env.close()
+
 
 if __name__ == "__main__":
     main()
