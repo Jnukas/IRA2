@@ -63,7 +63,7 @@ SCALES = {
     "pepper_grinder.stl": [1.0, 1.0, 1.0],  # ✅ YOUR file is already in meters
     
     # In millimeters - convert to meters
-    "rightwayup.stl": [0.001, 0.001, 0.001],
+    "rightwayup.stl": [1.0, 1.0, 1.0],
     "Potwithoutthelid.stl": [0.001, 0.001, 0.001],  # ✅ FIXED from [0.002, 0.002, 0.002]
     "jugfixed.stl": [0.001, 0.001, 0.001],
     "Fruit_and_Vegetables_Tray.stl": [0.001, 0.001, 0.001],
@@ -78,9 +78,9 @@ SCALES = {
 # Negative values = lower the object, Positive values = raise the object
 # Your table is now 1.05m tall, so offsets should be near 0
 HEIGHT_OFFSETS = {
-    "CR3": -0.14,   # Adjust if CR3 floats or sinks into table (start with 0)
-    "CR16": -0.14,  # Adjust if CR16 floats or sinks into table (start with 0)
-    "POT": -0.14,   # Adjust if pot floats or sinks into table (start with 0)
+    "CR3": 0,   # Adjust if CR3 floats or sinks into table (start with 0)
+    "CR16": 0, # Adjust if CR16 floats or sinks into table (start with 0)
+    "POT": 0,  # Adjust if pot floats or sinks into table (start with 0)
 }
 
 # ===== Motion toggles =====
