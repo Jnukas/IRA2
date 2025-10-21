@@ -85,9 +85,9 @@ POSITIONS = {
     "POT": (-1.15, -1),           # On table 1
     "JUG": (-0.65, 0),             # On table 2 (1.50 - 0.3)
     "PEPPER": (0.5, -0.3),         # On table 2 (1.50 - 0.3)
-    "BEEF": (0, 0),            # On table 2
+    "BEEF": (0.5, 0),            # On table 2
     "FRUIT_VEG": (0.65, -0.5),      # On table 2
-    "CHICKEN": (0, 0),         # On table 2 (1.50 + 0.3)
+    "CHICKEN": (0.5, 0),         # On table 2 (1.50 + 0.3)
     "UR3": (0, -0.5),             # LinearUR3 rail position
     "CR3": (-1.2, 0),            # CR3 robot
     "CR16": (-1, -2),           # CR16 robot
@@ -312,6 +312,7 @@ def main():
     # -------------------------
     
     SMALL_GAP = 0.003  # Small gap to prevent Z-fighting
+    TABLE_HEIGHT = 0.45  # Hardcoded table surface height (same as CR3)
     
     # Floor objects
     stove, _ = add_mesh(
@@ -335,41 +336,41 @@ def main():
     )
     print(f"✓ Table 2 top surface at Z = {table2_top_z:.4f} m")
 
-    # Objects on table 1
+    # Objects on table 1 - using hardcoded height
     pot, _ = add_mesh(
         "POT", "Potwithoutthelid.stl",
-        z_base=table_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[1.0, 0.0, 0.0, 1.0]
     )
 
-    # Objects on table 2
+    # Objects on table 2 - using hardcoded height
     jug, _ = add_mesh(
         "JUG", "jugfixed.stl",
-        z_base=table2_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[0.8, 0.9, 1.0, 1.0]
     )
 
     pepper_grinder, _ = add_mesh(
         "PEPPER", "pepper_grinder.stl",
-        z_base=table2_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[0.2, 0.2, 0.2, 1.0]
     )
 
     beef, _ = add_mesh(
         "BEEF", "beef.stl",
-        z_base=table2_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[0.8, 0.3, 0.3, 1.0]
     )
 
     fruit_veg_tray, _ = add_mesh(
         "FRUIT_VEG", "Fruit_and_Vegetables_Tray.stl",
-        z_base=table2_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[0.4, 0.7, 0.3, 1.0]
     )
 
     chicken, _ = add_mesh(
         "CHICKEN", "chicken.stl",
-        z_base=table2_top_z + SMALL_GAP,
+        z_base=TABLE_HEIGHT + SMALL_GAP,
         color=[1.0, 0.9, 0.7, 1.0]
     )
 
@@ -393,7 +394,7 @@ def main():
     cr3 = CR3Class()
 
     cr3_x, cr3_y = POSITIONS["CR3"]
-    CR3_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR3"]
+    CR3_Z = TABLE_HEIGHT + SMALL_GAP + HEIGHT_OFFSETS["CR3"]
     CR3_YAW = -math.pi / 2
     
     print(f"✓ CR3 base at Z = {CR3_Z:.4f} m (offset={HEIGHT_OFFSETS['CR3']:.4f})")
@@ -431,7 +432,7 @@ def main():
 
     if cr16 is not None:
         cr16_x, cr16_y = POSITIONS["CR16"]
-        CR16_Z = table_top_z + SMALL_GAP + HEIGHT_OFFSETS["CR16"]
+        CR16_Z = TABLE_HEIGHT + SMALL_GAP + HEIGHT_OFFSETS["CR16"]
         CR16_YAW = +math.pi / 2
         
         print(f"✓ CR16 base at Z = {CR16_Z:.4f} m (offset={HEIGHT_OFFSETS['CR16']:.4f})")
@@ -467,15 +468,17 @@ def main():
     print("\n" + "="*70)
     print("[Scene] All objects positioned with full control")
     print(f"  FLOOR_TOP = {FLOOR_TOP:.4f} m")
+    print(f"  TABLE_HEIGHT (hardcoded) = {TABLE_HEIGHT:.4f} m")
     print(f"  Table 1 top = {table_top_z:.4f} m")
     print(f"  Table 2 top = {table2_top_z:.4f} m")
     print("\n💡 To reposition objects:")
     print("   • Edit POSITIONS dictionary for X,Y coordinates")
     print("   • Edit HEIGHT_OFFSETS dictionary for Z adjustments")
+    print("   • Edit TABLE_HEIGHT constant to change table surface height")
     print("="*70 + "\n")
 
     def can_reach(robot, x, y, z, qseed=None):
-    # vertical tool (downward Z): Rx(pi) keeps wrist vertical
+        # vertical tool (downward Z): Rx(pi) keeps wrist vertical
         T_goal = SE3(x, y, z) @ SE3.Rx(math.pi)
         try:
             sol = robot.ikine_LM(T_goal, q0=(qseed if qseed is not None else robot.q))
@@ -485,13 +488,13 @@ def main():
             return False, None
 
     x_p, y_p = POSITIONS["POT"]
-    z_pick = table_top_z + 0.12   # ~12 cm above the table for approach
+    z_pick = TABLE_HEIGHT + 0.12   # ~12 cm above the hardcoded table height for approach
 
     ok_cr3, _  = can_reach(cr3,  x_p, y_p, z_pick)
     ok_cr16, _ = can_reach(cr16, x_p, y_p, z_pick)
     print(f"[reach] CR3={ok_cr3}  CR16={ok_cr16}  at POT=({x_p:.2f},{y_p:.2f},{z_pick:.2f})")
 
-        # -------------------------
+    # -------------------------
     # Phase 2: Motion (unchanged logic)
     # -------------------------
     q = ur3.q.copy()
