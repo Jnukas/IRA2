@@ -7,6 +7,8 @@ import math
 import time
 import importlib.util
 import inspect
+import threading                         ### SAFETY: NEW
+import tkinter as tk                     ### SAFETY: NEW
 
 import numpy as np
 import swift
@@ -54,11 +56,105 @@ def mesh_bounds_info(path: Path, scale_vec):
 
 
 # ===== Motion toggles (no placement changes) =====
-RUN_WIGGLE_CR3  = False
-RUN_WIGGLE_CR16 = False
-RUN_RAIL_SLIDE  = False
+RUN_WIGGLE_CR3  = True
+RUN_WIGGLE_CR16 = True
+RUN_RAIL_SLIDE  = True  # set True to demo the E-STOP easily
 FPS = 60
 DT = 1.0 / FPS
+
+### SAFETY: NEW — small, latched safety controller + GUI
+class SafetyController:
+    """
+    Latched e-stop:
+      - engage_e_stop(): immediately blocks motion (clears run event)
+      - disengage_e_stop(): remains blocked (READY state), requires resume()
+      - resume(): only works if e-stop not engaged; sets run event
+    No busy waiting: block_until_allowed() uses Event.wait(timeout=dt)
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._run_evt = threading.Event()
+        self._run_evt.set()              # allowed at start
+        self.e_stop_engaged = False      # latched flag
+
+    def engage_e_stop(self):
+        with self._lock:
+            self.e_stop_engaged = True
+            self._run_evt.clear()       # stop immediately
+
+    def disengage_e_stop(self):
+        with self._lock:
+            self.e_stop_engaged = False
+            # still paused; requires resume() explicitly
+
+    def resume(self):
+        with self._lock:
+            if not self.e_stop_engaged:
+                self._run_evt.set()      # allow motion again
+
+    def is_running(self) -> bool:
+        return self._run_evt.is_set() and not self.e_stop_engaged
+
+    def block_until_allowed(self, env, dt: float):
+        """
+        Gate for motion loops: while not allowed, we wait with timeout and
+        step the env so UI stays responsive (no busy loop).
+        """
+        while not self._run_evt.wait(timeout=dt):
+            # During pause, keep UI responsive without advancing robot states
+            try:
+                env.step(dt)
+            except Exception:
+                time.sleep(dt)
+            # If re-engaged while READY, we remain blocked; resume will set the event
+
+def launch_safety_gui(safety: SafetyController):
+    """Tiny Tk window with E-STOP + RESUME buttons (latched behaviour)."""
+    root = tk.Tk()
+    root.title("Safety Panel")
+    root.geometry("280x190")
+    try:
+        root.wm_attributes("-topmost", True)
+    except Exception:
+        pass
+
+    status = tk.StringVar(value="RUNNING")
+
+    def refresh_label():
+        if safety.e_stop_engaged:
+            status.set("E-STOP ENGAGED")
+        elif safety.is_running():
+            status.set("RUNNING")
+        else:
+            status.set("READY (disengaged, press RESUME)")
+
+    def on_estop():
+        # Toggle: engage if currently running/ready; else disengage to READY
+        if not safety.e_stop_engaged:
+            safety.engage_e_stop()
+        else:
+            safety.disengage_e_stop()  # stays paused (READY)
+        refresh_label()
+
+    def on_resume():
+        # Only resumes if not engaged
+        safety.resume()
+        refresh_label()
+
+    font_btn = ("Segoe UI", 16, "bold")
+    btn_estop = tk.Button(root, text="E-STOP", command=on_estop,
+                          bg="#b30000", fg="white", font=font_btn, height=2)
+    btn_resume = tk.Button(root, text="RESUME", command=on_resume,
+                           bg="#006400", fg="white", font=font_btn, height=2)
+    lbl = tk.Label(root, textvariable=status, font=("Segoe UI", 12))
+
+    btn_estop.pack(fill="x", padx=10, pady=(12, 6))
+    btn_resume.pack(fill="x", padx=10, pady=6)
+    lbl.pack(pady=(8, 6))
+
+    refresh_label()
+    root.mainloop()
+# --- end SAFETY block ---
 
 
 def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
@@ -103,6 +199,10 @@ def main():
     env = swift.Swift()
     env.launch(realtime=True, browser=None, host="127.0.0.1", port=52100, ws_port=53100)
 
+    ### SAFETY: NEW — start safety controller + GUI on a daemon thread
+    safety = SafetyController()
+    threading.Thread(target=launch_safety_gui, args=(safety,), daemon=True).start()
+
     # -------------------------
     # Room (constants + build)
     # -------------------------
@@ -119,7 +219,6 @@ def main():
         floor_top=FLOOR_TOP,
     )
 
-    # -------------------------
     # -------------------------
     # Stove (STL)
     # -------------------------
@@ -372,6 +471,7 @@ def main():
             qg[j] += np.deg2rad(15)
             traj = rtb.jtraj(qs, qg, t)
             for qk in traj.q:
+                safety.block_until_allowed(env, DT)    ### SAFETY: gate each step
                 cr3.q = qk
                 env.step(DT)
                 time.sleep(DT)
@@ -389,6 +489,7 @@ def main():
             qg[j] += np.deg2rad(12)
             traj = rtb.jtraj(qs, qg, t)
             for qk in traj.q:
+                safety.block_until_allowed(env, DT)    ### SAFETY: gate each step
                 cr16.q = qk
                 env.step(DT)
                 time.sleep(DT)
@@ -404,6 +505,7 @@ def main():
         t = np.arange(0, T + DT, DT)
         traj = rtb.jtraj(q_start, q_goal, t)  # LSPB with zero vel at ends
         for qk in traj.q:
+            safety.block_until_allowed(env, DT)        ### SAFETY: gate each step
             ur3.q = qk
             env.step(DT)
             time.sleep(DT)

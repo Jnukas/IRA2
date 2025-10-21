@@ -1,8 +1,3 @@
-##  @file
-#   @brief UR3 Robot defined by standard DH parameters with 3D model
-#   @author Ho Minh Quang Ngo
-#   @date Jul 20, 2023
-
 import swift
 import roboticstoolbox as rtb
 import spatialmath.base as spb
