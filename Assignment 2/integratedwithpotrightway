@@ -1508,8 +1508,7 @@ def main():
         # All ingredients stay in the pot (move with it)
         beef.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
         chicken.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
-        pepper_grinder.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
-        jug.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+
         
         env.step(DT)
         time.sleep(DT)
@@ -1517,11 +1516,10 @@ def main():
     print("[CR16] Pot placed on stove!")
     
     # Release pot on stove with flip
-    pot.T = SE3(stove_x, stove_y, stove_z - 0.1)
+    pot.T = SE3(stove_x, stove_y, stove_z - 0.3)
     beef.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
     chicken.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
-    pepper_grinder.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
-    jug.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
+
     
     # Update scene to show the flip
     env.step(DT)
