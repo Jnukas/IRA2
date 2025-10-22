@@ -1,0 +1,1537 @@
+#!/usr/bin/env python3
+# room_only_fixed.py — Z-positioning consistency fixes with FULL CONTROL
+from __future__ import annotations
+
+from pathlib import Path
+import math
+import time
+import importlib.util
+import inspect
+import threading
+import tkinter as tk
+
+import numpy as np
+import swift
+import spatialgeometry as sg
+import roboticstoolbox as rtb
+from spatialmath import SE3
+
+from room_utils import apply_swift_browser_fix, make_room
+from ir_support.robots.LinearUR3 import LinearUR3
+from ir_support import RectangularPrism, line_plane_intersection
+
+# --- asset helpers -----------------------------------------------------------
+try:
+    import trimesh
+except Exception:
+    trimesh = None
+
+from itertools import combinations
+
+def _np(v):
+    import numpy as _np
+    return _np.array(v, dtype=float)
+
+def mesh_bounds_info(path: Path, scale_vec):
+    """
+    Returns (z_lift, size_m) where z_lift raises the mesh so its lowest vertex sits at z=0,
+    using the SAME scale you pass to sg.Mesh (either scalar or [sx,sy,sz]).
+    If trimesh is unavailable, returns (0.0, None).
+    """
+    if trimesh is None:
+        return 0.0, None
+
+    tm = trimesh.load_mesh(str(path), process=False)
+
+    bmin = np.asarray(tm.bounds[0], dtype=float)
+    bmax = np.asarray(tm.bounds[1], dtype=float)
+
+    sv = np.asarray(scale_vec, dtype=float)
+    if sv.size == 1:
+        sv = np.repeat(float(sv), 3)
+    elif sv.size != 3:
+        raise ValueError("scale_vec must be a scalar or a 3-vector")
+
+    size_m = (bmax - bmin) * sv
+    z_lift = -bmin[2] * sv[2]
+
+    return float(z_lift), size_m
+
+
+# ===== VERIFIED SCALES (Based on YOUR actual STL verification output) =====
+SCALES = {
+    # Already in meters - no conversion needed
+    "Stove.stl": [1.0, 1.0, 1.0],
+    "table.stl": [1.0, 1.0, 1.0],
+    "pepper_grinder.stl": [1.0, 1.0, 1.0],
+    "barrier.stl" : [1.0, 1.0, 1.0],
+    "hardwarestop.stl": [1.0, 1.0, 1.0],  # change to [0.001,0.001,0.001] if the STL is in mm
+    
+    # In millimeters - convert to meters
+    "rightwayup.stl": [1.0, 1.0, 1.0],
+    "Potwithoutthelid.stl": [0.001, 0.001, 0.001],
+    "jugfixed.stl": [1.0, 1.0, 1.0],
+    "Fruit_and_Vegetables_Tray.stl": [0.001, 0.001, 0.001],
+    
+    # In centimeters - convert to meters
+    "beef.stl": [0.01, 0.01, 0.01],
+    "chicken.stl": [0.01, 0.01, 0.01],
+}
+
+# =====================================================================
+# POSITION CONTROL CENTER
+# =====================================================================
+# Change X, Y positions here (in meters, relative to room center)
+POSITIONS = {
+    # Format: "NAME": (x = red, y = green -closer to back wall) 
+    "STOVE": (0.0, -2.4),           # Back wall
+    "TABLE1": (-1.3, -2.5),         # First table
+    "TABLE2": (1.3, 0.5),          # Work table (second table = grocery table)
+    "POT": (-1.15, -1),           # On table 1
+    "JUG": (0.4, -1.3),             # On table 2 (1.50 - 0.3)
+    "PEPPER": (0.35, -0.7),         # On table 2 (1.50 - 0.3)
+    "BEEF": (0.2, -1),            # On table 2
+    "FRUIT_VEG": (0.6, -0.5),      # On table 2
+    "CHICKEN": (0.25, -1),         # On table 2 (1.50 + 0.3)
+    "UR3": (0, -0.5),             # LinearUR3 rail position
+    "CR3": (-0.5, -0.4),            # CR3 robot
+    "CR16": (-0.5, -1.5),           # CR16 robot
+    "BARRIER" : (-0.75, 1.25),
+    "HW_STOP": (0.7, 0),
+}
+
+# HEIGHT ADJUSTMENTS (in meters)
+# Negative = lower, Positive = raise
+# Start with 0 for all objects, then adjust if they float or sink
+HEIGHT_OFFSETS = {
+    # Robots
+    "CR3": -0.02,      # On table 1
+    "CR16": -0.02,     # On table 1
+    "UR3": 0,      # On floor
+    
+    # Tables
+    "STOVE": 0.0,    # On floor
+    "TABLE1": 0.0,   # On floor
+    "TABLE2": 0.0,   # On floor
+    
+    # Items on tables
+    "POT": -0.02,      # On table 1
+    "JUG": -0.02,      # On table 2
+    "PEPPER": -0.02,   # On table 2
+    "BEEF": -0.02,     # On table 2
+    "FRUIT_VEG": -0.02,  # On table 2
+    "CHICKEN": -0.02,  # On table 2
+    "BARRIER" : 0.0,
+    "HW_STOP": -0.02,
+}
+
+# ===== Motion toggles =====
+RUN_WIGGLE_CR3  = True
+RUN_WIGGLE_CR16 = True
+RUN_RAIL_SLIDE  = True
+FPS = 60
+DT = 1.0 / FPS
+# ========================= hardware
+import serial  # pip install pyserial
+# ... (code above)
+
+def start_arduino_estop_listener(safety, port="COM3", baud=115200, verbose=True):
+    """
+    Listen for lines like 'E,1' from the Arduino.
+    On 'E,1' -> engage_e_stop() (latched). 'E,0' is ignored (resume via GUI).
+    """
+    def _worker():
+        try:
+            ser = serial.Serial(port, baudrate=baud, timeout=0.05)
+            # Uno resets on serial open; give it time to boot
+            time.sleep(2.0)
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            print(f"[E-STOP] Listening on {port} @ {baud}")
+        except Exception as e:
+            print(f"[E-STOP] Serial open failed ({port}): {e}")
+            return
+
+        while True:
+            try:
+                line = ser.readline().decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if verbose:
+                    print(f"[E-STOP] RX: {line}")
+                if line.startswith("E,"):
+                    parts = line.split(",", 1)
+                    if len(parts) == 2 and parts[1].strip() == "1":
+                        if not safety.e_stop_engaged:
+                            print("🔴 [E-STOP] Arduino button pressed → E-STOP engaged")
+                        safety.engage_e_stop()
+            except Exception as e:
+                print(f"[E-STOP] Listener error: {e}")
+                break
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return t
+
+# ===== Safety Controller (unchanged) =====
+class SafetyController:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._run_evt = threading.Event()
+        self._run_evt.set()
+        self.e_stop_engaged = False
+
+    def engage_e_stop(self):
+        with self._lock:
+            self.e_stop_engaged = True
+            self._run_evt.clear()
+
+    def disengage_e_stop(self):
+        with self._lock:
+            self.e_stop_engaged = False
+
+    def resume(self):
+        with self._lock:
+            if not self.e_stop_engaged:
+                self._run_evt.set()
+
+    def is_running(self) -> bool:
+        return self._run_evt.is_set() and not self.e_stop_engaged
+
+    def block_until_allowed(self, env, dt: float):
+        while not self._run_evt.wait(timeout=dt):
+            try:
+                env.step(dt)
+            except Exception:
+                time.sleep(dt)
+
+def launch_safety_gui(safety: SafetyController):
+    root = tk.Tk()
+    root.title("Safety Panel")
+    root.geometry("280x190")
+    try:
+        root.wm_attributes("-topmost", True)
+    except Exception:
+        pass
+
+    status = tk.StringVar(value="RUNNING")
+
+    def refresh_label():
+        if safety.e_stop_engaged:
+            status.set("E-STOP ENGAGED")
+        elif safety.is_running():
+            status.set("RUNNING")
+        else:
+            status.set("READY (disengaged, press RESUME)")
+
+    def on_estop():
+        if not safety.e_stop_engaged:
+            safety.engage_e_stop()
+        else:
+            safety.disengage_e_stop()
+        refresh_label()
+
+    def on_resume():
+        safety.resume()
+        refresh_label()
+
+    font_btn = ("Segoe UI", 16, "bold")
+    btn_estop = tk.Button(root, text="E-STOP", command=on_estop,
+                          bg="#b30000", fg="white", font=font_btn, height=2)
+    btn_resume = tk.Button(root, text="RESUME", command=on_resume,
+                           bg="#006400", fg="white", font=font_btn, height=2)
+    lbl = tk.Label(root, textvariable=status, font=("Segoe UI", 12))
+
+    btn_estop.pack(fill="x", padx=10, pady=(12, 6))
+    btn_resume.pack(fill="x", padx=10, pady=6)
+    lbl.pack(pady=(8, 6))
+
+    refresh_label()
+    root.mainloop()
+
+
+def _load_robot_class(pyfile: Path, prefer_names: tuple[str, ...]) -> type:
+    if not pyfile.exists():
+        raise FileNotFoundError(f"Robot file not found: {pyfile}")
+
+    spec = importlib.util.spec_from_file_location("user_robot_module", str(pyfile))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    for name in prefer_names:
+        if hasattr(mod, name) and inspect.isclass(getattr(mod, name)):
+            return getattr(mod, name)
+
+    candidates = []
+    RobotBase = getattr(rtb, "Robot", tuple())
+    for name, obj in vars(mod).items():
+        if inspect.isclass(obj):
+            try:
+                if issubclass(obj, (rtb.ERobot, rtb.DHRobot, RobotBase)):
+                    candidates.append((name, obj))
+            except Exception:
+                pass
+
+    if candidates:
+        print(f"[loader] Using {candidates[0][0]} from {pyfile.name}")
+        return candidates[0][1]
+
+    raise ImportError(f"No robot class found in {pyfile.name}.")
+
+
+def is_intersection_point_inside_triangle(intersect_p, triangle_verts):
+    """Check if intersection point is inside a triangle using barycentric coordinates"""
+    u = triangle_verts[1, :] - triangle_verts[0, :]
+    v = triangle_verts[2, :] - triangle_verts[0, :]
+
+    uu = np.dot(u, u)
+    uv = np.dot(u, v)
+    vv = np.dot(v, v)
+
+    w = intersect_p - triangle_verts[0, :]
+    wu = np.dot(w, u)
+    wv = np.dot(w, v)
+
+    D = uv * uv - uu * vv
+    
+    if abs(D) < 1e-9:
+        return False
+
+    # Get and test parametric coords (s and t)
+    s = (uv * wv - vv * wu) / D
+    if s < 0.0 or s > 1.0:
+        return False
+
+    t = (uv * wu - uu * wv) / D
+    if t < 0.0 or (s + t) > 1.0:
+        return False
+
+    return True
+
+
+def get_link_points(robot, q=None):
+    """Return Nx3 array of joint positions (base + each link end) in world frame"""
+    if q is None:
+        q = robot.q
+    
+    # Get all link transforms
+    T_all = robot.fkine_all(q)
+    
+    # Start with base position
+    base_pos = robot.base.t if hasattr(robot.base, 't') else robot.base.A[:3, 3]
+    pts = [base_pos.tolist() if hasattr(base_pos, 'tolist') else list(base_pos)]
+    
+    # Add each link end position
+    if hasattr(T_all, '__iter__'):
+        for T in T_all:
+            if hasattr(T, 't'):
+                pts.append(T.t.tolist())
+            elif hasattr(T, 'A'):
+                pts.append(T.A[:3, 3].tolist())
+            else:
+                pts.append(T[:3, 3].tolist())
+    else:
+        # Single transform
+        if hasattr(T_all, 't'):
+            pts.append(T_all.t.tolist())
+        elif hasattr(T_all, 'A'):
+            pts.append(T_all.A[:3, 3].tolist())
+            
+    return np.asarray(pts, dtype=float)
+
+
+def check_collision(robot, q, obstacles_list, env=None, visualize=False, robot_name="Robot"):
+    """
+    Check if robot at configuration q collides with any obstacles.
+    
+    Args:
+        robot: Robot model
+        q: Joint configuration
+        obstacles_list: List of (faces, vertices, face_normals) tuples for each obstacle
+        env: Swift environment (optional, for visualization)
+        visualize: If True, show collision points as red spheres
+        robot_name: Name of robot for console output
+    
+    Returns:
+        True if collision detected, False otherwise
+    """
+    # Get link segment endpoints
+    pts = get_link_points(robot, q)
+    
+    # Check each link segment against each obstacle
+    for i in range(len(pts) - 1):
+        link_start = pts[i]
+        link_end = pts[i + 1]
+        
+        # Check against all obstacles
+        for obs_idx, (faces, vertices, face_normals) in enumerate(obstacles_list):
+            for j, face in enumerate(faces):
+                vert_on_plane = vertices[face][0]
+                intersect_p, check = line_plane_intersection(
+                    face_normals[j], 
+                    vert_on_plane, 
+                    link_start, 
+                    link_end
+                )
+                
+                if check == 1:
+                    # Check all possible triangulations of this face
+                    triangle_list = np.array(list(combinations(face, 3)), dtype=int)
+                    for triangle in triangle_list:
+                        if is_intersection_point_inside_triangle(intersect_p, vertices[triangle]):
+                            print(f"🔴 [{robot_name}] COLLISION DETECTED!")
+                            print(f"   Link {i} collided with obstacle {obs_idx+1} at position: ({intersect_p[0]:.3f}, {intersect_p[1]:.3f}, {intersect_p[2]:.3f})")
+                            
+                            if visualize and env is not None:
+                                collision_sphere = sg.Sphere(radius=0.05, color=[1.0, 0.0, 0.0, 1.0])
+                                collision_sphere.T = SE3(intersect_p[0], intersect_p[1], intersect_p[2]).A
+                                env.add(collision_sphere)
+                            return True
+    return False
+
+
+def main():
+    # -------------------------
+    # Launch Swift
+    # -------------------------
+    apply_swift_browser_fix()
+    env = swift.Swift()
+    env.launch(realtime=True, browser=None, host="127.0.0.1", port=52100, ws_port=53100)
+
+    safety = SafetyController()
+    threading.Thread(target=launch_safety_gui, args=(safety,), daemon=True).start()
+    start_arduino_estop_listener(safety, port="COM9", baud=115200)  # change COM port if needed
+    # -------------------------
+    # Room Constants
+    # -------------------------
+    ROOM_W = 6.0
+    ROOM_D = 6.0
+    FLOOR_TOP = 0.005  # All Z measurements relative to this
+
+    make_room(
+        env,
+        room_w=ROOM_W,
+        room_d=ROOM_D,
+        floor_t=0.10,
+        open_side="+Y",
+        floor_top=FLOOR_TOP,
+    )
+
+    # -------------------------
+    # Helper: Add mesh with consistent Z positioning
+    # -------------------------
+    def add_mesh(obj_name: str, filename: str, rotation_z: float = 0.0,
+                 z_base: float = FLOOR_TOP, color=None, extra_rotation=None):
+        """
+        Add a mesh with automatic Z positioning and named height offset.
+        
+        Args:
+            obj_name: Name key for POSITIONS and HEIGHT_OFFSETS lookups
+            filename: STL filename (looked up in SCALES dict)
+            rotation_z: Rotation around Z axis (radians)
+            z_base: Base height (default: FLOOR_TOP for floor-level objects)
+            color: RGBA color list
+            extra_rotation: Additional SE3 rotation to apply after Rz
+        
+        Returns:
+            (mesh_object, top_z) where top_z is the height of the top surface
+        """
+        x, y = POSITIONS.get(obj_name, (0.0, 0.0))
+        height_offset = HEIGHT_OFFSETS.get(obj_name, 0.0)
+        
+        path = Path(__file__).parent / "assets" / filename
+        scale = SCALES.get(filename, [1.0, 1.0, 1.0])
+        
+        z_lift, size_m = mesh_bounds_info(path, scale)
+        
+        if size_m is not None:
+            print(f"{obj_name:15s} {filename:30s} size (m): X={size_m[0]:.3f}  Y={size_m[1]:.3f}  Z={size_m[2]:.3f}")
+            top_z = z_base + z_lift + float(size_m[2]) + height_offset
+        else:
+            print(f"{obj_name:15s} {filename:30s} [trimesh unavailable]")
+            top_z = z_base + z_lift + height_offset
+        
+        mesh = sg.Mesh(
+            filename=str(path),
+            scale=scale,
+            color=color or [0.7, 0.7, 0.7, 1.0],
+        )
+        
+        # Build transformation: translate to position, then rotate
+        T = SE3(x, y, z_base + z_lift + height_offset) @ SE3.Rz(rotation_z)
+        if extra_rotation is not None:
+            T = T @ extra_rotation
+        
+        mesh.T = T
+        env.add(mesh)
+        
+        return mesh, top_z
+
+    # -------------------------
+    # Add all objects with named positioning
+    # -------------------------
+    
+    SMALL_GAP = 0.003  # Small gap to prevent Z-fighting
+    TABLE_HEIGHT = 0.45  # Hardcoded table surface height (same as CR3)
+    
+    # Create collision geometry for tables (will be used for collision detection)
+    obstacles_list = []
+    
+    # Floor objects
+    stove, _ = add_mesh(
+        "STOVE", "Stove.stl",
+        rotation_z=math.pi,
+        color=[0.70, 0.70, 0.70, 1.0]
+    )
+
+    table, table_top_z = add_mesh(
+        "TABLE1", "table.stl",
+        rotation_z=math.pi / 2,
+        color=[0.50, 0.50, 0.50, 1.0]
+    )
+    print(f"✓ Table 1 top surface at Z = {table_top_z:.4f} m")
+    
+    # Add table 1 collision geometry
+    table1_x, table1_y = POSITIONS["TABLE1"]
+    table1_lwh = [1.5, 1.0, 0.8]  # Approximate table dimensions
+    table1_center = [table1_x, table1_y, table_top_z / 2]
+    vertices_t1, faces_t1, normals_t1 = RectangularPrism(
+        table1_lwh[0], table1_lwh[1], table1_lwh[2], center=table1_center
+    ).get_data()
+    obstacles_list.append((faces_t1, vertices_t1, normals_t1))
+
+    work_table, table2_top_z = add_mesh(
+        "TABLE2", "rightwayup.stl",
+        rotation_z=0.0,
+        extra_rotation=SE3.RPY([-90, 0, 0], order='xyz', unit='deg'),
+        color=[0.50, 0.50, 0.50, 1.0]
+    )
+    print(f"✓ Table 2 top surface at Z = {table2_top_z:.4f} m")
+    
+    # Add table 2 collision geometry
+    table2_x, table2_y = POSITIONS["TABLE2"]
+    table2_lwh = [1.5, 1.0, 0.8]  # Approximate table dimensions
+    table2_center = [table2_x, table2_y, table2_top_z / 2]
+    vertices_t2, faces_t2, normals_t2 = RectangularPrism(
+        table2_lwh[0], table2_lwh[1], table2_lwh[2], center=table2_center
+    ).get_data()
+    obstacles_list.append((faces_t2, vertices_t2, normals_t2))
+
+    # Objects on table 1 - using hardcoded height
+    pot, _ = add_mesh(
+        "POT", "Potwithoutthelid.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[1.0, 0.0, 0.0, 1.0]
+    )
+
+    # Objects on table 2 - using hardcoded height
+    jug, _ = add_mesh(
+        "JUG", "jugfixed.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[0.8, 0.9, 1.0, 1.0]
+    )
+
+    pepper_grinder, _ = add_mesh(
+        "PEPPER", "pepper_grinder.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[0.2, 0.2, 0.2, 1.0]
+    )
+
+    beef, _ = add_mesh(
+        "BEEF", "beef.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[0.8, 0.3, 0.3, 1.0]
+    )
+
+    fruit_veg_tray, _ = add_mesh(
+        "FRUIT_VEG", "Fruit_and_Vegetables_Tray.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[0.4, 0.7, 0.3, 1.0]
+    )
+
+    chicken, _ = add_mesh(
+        "CHICKEN", "chicken.stl",
+        z_base=TABLE_HEIGHT + SMALL_GAP,
+        color=[1.0, 0.9, 0.7, 1.0]
+    )
+    # --- Barrier (visual) ---
+    barrier_mesh, barrier_top_z = add_mesh(
+    "BARRIER", "barrier.stl",
+    rotation_z=0.0,                          # rotate around Z if you need to yaw it
+    z_base=FLOOR_TOP + SMALL_GAP,            # on the floor
+    color=[0.90, 0.20, 0.20, 1.0],
+)
+
+    # --- Hardware Stop (on Table 2) ---
+    hw_stop, hw_top_z = add_mesh(
+    "HW_STOP", "hardwarestop.stl",
+    z_base=TABLE_HEIGHT + SMALL_GAP,
+    color=[1.0, 0.2, 0.2, 1.0],   # bright red
+)
+
+    # -------------------------
+    # Linear UR3 on rail
+    # -------------------------
+    ur3 = LinearUR3()
+    ur3_x, ur3_y = POSITIONS["UR3"]
+    RAIL_Z = FLOOR_TOP + SMALL_GAP + HEIGHT_OFFSETS["UR3"]
+    YAW = math.pi / 2
+
+    ur3.base = SE3(ur3_x, ur3_y, RAIL_Z) @ SE3.Rz(YAW) @ ur3.base
+    ur3.add_to_env(env)
+    print(f"✓ UR3 base at Z = {RAIL_Z:.4f} m")
+
+    # -------------------------
+    # CR3 Robot
+    # -------------------------
+    CR3_FILE = Path(__file__).parent / "Cr3UR3editon.py"
+    CR3Class = _load_robot_class(CR3_FILE, ("CR3", "Cr3UR3editon", "DobotCR3", "RobotCR3"))
+    cr3 = CR3Class()
+
+    cr3_x, cr3_y = POSITIONS["CR3"]
+    CR3_Z = TABLE_HEIGHT + SMALL_GAP + HEIGHT_OFFSETS["CR3"]
+    CR3_YAW = -math.pi / 2
+    
+    print(f"✓ CR3 base at Z = {CR3_Z:.4f} m (offset={HEIGHT_OFFSETS['CR3']:.4f})")
+
+    base0_cr3 = getattr(cr3, "base", SE3())
+    cr3.base = SE3(cr3_x, cr3_y, CR3_Z) @ SE3.Rz(CR3_YAW) @ base0_cr3
+
+    try:
+        q_spawn = cr3.q.copy()
+    except Exception:
+        q_spawn = np.zeros(getattr(cr3, "n", 6))
+    cr3.q = q_spawn
+    if hasattr(cr3, "qtest"):
+        cr3.qtest = q_spawn
+
+    if hasattr(cr3, "add_to_env"):
+        cr3.add_to_env(env)
+    else:
+        env.add(cr3)
+    env.step(0.02)
+
+    # -------------------------
+    # CR16 Robot
+    # -------------------------
+    CR16_FILE = Path(__file__).parent / "CR16Creator.py"
+    try:
+        CR16Class = _load_robot_class(CR16_FILE, ("CR16", "DobotCR16", "RobotCR16", "Cr16", "Cr16UR3Edition"))
+        try:
+            cr16 = CR16Class()
+        except TypeError:
+            cr16 = CR16Class(use_mesh=False)
+    except Exception as e:
+        print("[CR16] Load skipped:", e)
+        cr16 = None
+
+    if cr16 is not None:
+        cr16_x, cr16_y = POSITIONS["CR16"]
+        CR16_Z = TABLE_HEIGHT + SMALL_GAP + HEIGHT_OFFSETS["CR16"]
+        CR16_YAW = +math.pi / 2
+        
+        print(f"✓ CR16 base at Z = {CR16_Z:.4f} m (offset={HEIGHT_OFFSETS['CR16']:.4f})")
+
+        base0_cr16 = getattr(cr16, "base", SE3())
+        cr16.base = SE3(cr16_x, cr16_y, CR16_Z) @ SE3.Rz(CR16_YAW) @ base0_cr16
+
+        try:
+            if hasattr(cr16, "q_home"):
+                q_spawn16 = cr16.q_home
+            elif hasattr(cr16, "qtest"):
+                q_spawn16 = cr16.qtest
+            else:
+                q_spawn16 = cr16.q.copy()
+        except Exception:
+            q_spawn16 = np.zeros(getattr(cr16, "n", 6))
+        cr16.q = q_spawn16
+
+        try:
+            if hasattr(cr16, "add_to_env"):
+                cr16.add_to_env(env)
+            else:
+                from ir_support import CylindricalDHRobotPlot
+                CylindricalDHRobotPlot(cr16).add_to_env(env)
+            env.step(0.02)
+        except Exception as e:
+            print("[CR16] Visual add failed:", e)
+
+    # -------------------------
+    # Scene Summary
+    # -------------------------
+    env.step(0.02)
+    print("\n" + "="*70)
+    print("[Scene] All objects positioned with full control")
+    print(f"  FLOOR_TOP = {FLOOR_TOP:.4f} m")
+    print(f"  TABLE_HEIGHT (hardcoded) = {TABLE_HEIGHT:.4f} m")
+    print(f"  Table 1 top = {table_top_z:.4f} m")
+    print(f"  Table 2 top = {table2_top_z:.4f} m")
+    print(f"\n[Collision Detection] Monitoring {len(obstacles_list)} obstacle(s)")
+    print("\n💡 To reposition objects:")
+    print("   • Edit POSITIONS dictionary for X,Y coordinates")
+    print("   • Edit HEIGHT_OFFSETS dictionary for Z adjustments")
+    print("   • Edit TABLE_HEIGHT constant to change table surface height")
+    print("="*70 + "\n")
+
+    # -------------------------
+    # UR3 Movement to Beef
+    # -------------------------
+    interpolation = 2           # 1 = Quintic Polynomial, 2 = Trapezoidal Velocity
+    steps = 50                  # Specify no. of steps
+    
+    # Get beef position
+    beef_x, beef_y = POSITIONS["BEEF"]
+    beef_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    
+    # Define end-effector pose as a 4x4 Homogeneous Transformation Matrix
+    # Use SE3 to create translation and rotation (vertical gripper pointing down)
+    T_beef = SE3(beef_x, beef_y, beef_z) @ SE3.Rx(math.pi)
+    
+    # Get current joint configuration
+    q_current = ur3.q.copy()
+    
+    # Solve inverse kinematics to get required joint angles
+    print("\n[UR3] Calculating inverse kinematics for beef position...")
+    sol = ur3.ikine_LM(T_beef, q0=q_current)
+    q_beef = sol.q
+    
+    # Check if solution is valid and within joint limits
+    q_beef_in_limits = not ur3.islimit(q_beef)
+    print(f"q_beef within joint limits: {q_beef_in_limits}")
+    if not q_beef_in_limits:
+        print(f"Warning: q_beef may be outside limits: {q_beef}")
+    
+    # Generate a matrix of interpolated joint angles using chosen method
+    if interpolation == 1:
+        # Quintic Polynomial
+        q_matrix = rtb.jtraj(q_current, q_beef, steps).q
+    elif interpolation == 2:
+        # Trapezoidal Velocity
+        from roboticstoolbox import trapezoidal
+        s = trapezoidal(0, 1, steps).q                          # Create the scalar function
+        q_matrix = np.empty((steps, ur3.n))                     # Create memory allocation
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_beef  # Generate interpolated joint angles
+    else:
+        raise ValueError("interpolation = 1 for Quintic Polynomial, or 2 for Trapezoidal Velocity")
+    
+    print(f"\n[UR3] Moving to beef at ({beef_x:.2f}, {beef_y:.2f}, {beef_z:.2f})...")
+    print("Press Ctrl+C to stop\n")
+    
+    # Animate the trajectory
+    for i, q in enumerate(q_matrix):
+        safety.block_until_allowed(env, DT)
+        
+        # Check for collision before moving
+        if check_collision(ur3, q, obstacles_list, robot_name="UR3"):
+            pass  # Collision message already printed in check_collision
+        
+        ur3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Reached beef position!")
+    print("[UR3] Beef is now attached to end-effector")
+    
+    # -------------------------
+    # Attach beef to UR3 end-effector with offset
+    # -------------------------
+    # Define offset for beef relative to end-effector (in meters)
+    BEEF_OFFSET_X = -0.3
+    BEEF_OFFSET_Y = -0.09
+    BEEF_OFFSET_Z = 0  # 5cm below end-effector
+    
+    # Create offset transformation
+    T_offset = SE3(BEEF_OFFSET_X, BEEF_OFFSET_Y, BEEF_OFFSET_Z)
+    
+    # Now move the beef to follow the UR3 end-effector with offset
+    # Get the current end-effector transform
+    T_ee = ur3.fkine(ur3.q)
+    
+    # Apply offset to end-effector transform
+    beef.T = T_ee @ T_offset
+    env.step(DT)
+    time.sleep(0.5)
+    
+    # -------------------------
+    # Move UR3 to demonstrate beef following
+    # -------------------------
+    print("\n[UR3] Moving to new position with beef attached...")
+    
+    # Define a new target position (move up and to the side)
+    target_x = -beef_x - 0.2
+    target_y = beef_y
+    target_z = beef_z + 0.05
+    
+    T_target = SE3(target_x, target_y, target_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for new position
+    q_current = ur3.q.copy()
+    sol_target = ur3.ikine_LM(T_target, q0=q_current)
+    q_target = sol_target.q
+    
+    # Generate trajectory
+    if interpolation == 1:
+        q_matrix_move = rtb.jtraj(q_current, q_target, steps).q
+    elif interpolation == 2:
+        s_move = trapezoidal(0, 1, steps).q
+        q_matrix_move = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_move[i, :] = (1 - s_move[i]) * q_current + s_move[i] * q_target
+    
+    # Animate trajectory with beef following (with offset)
+    for i, q in enumerate(q_matrix_move):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # Update beef position to follow end-effector with offset
+        T_ee = ur3.fkine(ur3.q)
+        beef.T = T_ee @ T_offset
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Movement complete - beef followed end-effector with offset!")
+    
+    # -------------------------
+    # Release beef at target position
+    # -------------------------
+    print("\n[UR3] Releasing beef...")
+    
+    # Store the final beef position and flip it upright
+    T_beef_final = beef.T @ SE3.Rx(math.pi).A  # Flip 180 degrees around X to make upright
+    
+    # -------------------------
+    # UR3 Movement to Chicken (directly from beef placement)
+    # -------------------------
+    print("\n[UR3] Moving to chicken...")
+    
+    # Get chicken position
+    chicken_x, chicken_y = POSITIONS["CHICKEN"]
+    chicken_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    
+    # Define end-effector pose for chicken
+    T_chicken = SE3(chicken_x, chicken_y, chicken_z) @ SE3.Rx(math.pi)
+    
+    # Get current joint configuration
+    q_current = ur3.q.copy()
+    
+    # Solve inverse kinematics for chicken position
+    print("[UR3] Calculating inverse kinematics for chicken position...")
+    sol = ur3.ikine_LM(T_chicken, q0=q_current)
+    q_chicken = sol.q
+    
+    # Check if solution is valid and within joint limits
+    q_chicken_in_limits = not ur3.islimit(q_chicken)
+    print(f"q_chicken within joint limits: {q_chicken_in_limits}")
+    if not q_chicken_in_limits:
+        print(f"Warning: q_chicken may be outside limits: {q_chicken}")
+    
+    # Generate trajectory to chicken
+    if interpolation == 1:
+        q_matrix = rtb.jtraj(q_current, q_chicken, steps).q
+    elif interpolation == 2:
+        s = trapezoidal(0, 1, steps).q
+        q_matrix = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_chicken
+    
+    # Animate the trajectory to chicken
+    for i, q in enumerate(q_matrix):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Reached chicken position!")
+    print("[UR3] Chicken is now attached to end-effector")
+    
+    # -------------------------
+    # Attach chicken to UR3 end-effector with offset
+    # -------------------------
+    # Define offset for chicken relative to end-effector (in meters)
+    CHICKEN_OFFSET_X = -0.3
+    CHICKEN_OFFSET_Y = -0.09
+    CHICKEN_OFFSET_Z = 0
+    
+    # Create offset transformation for chicken
+    T_offset_chicken = SE3(CHICKEN_OFFSET_X, CHICKEN_OFFSET_Y, CHICKEN_OFFSET_Z)
+    
+    # Attach chicken to end-effector
+    T_ee = ur3.fkine(ur3.q)
+    chicken.T = T_ee @ T_offset_chicken
+    env.step(DT)
+    time.sleep(0.5)
+    
+    # -------------------------
+    # Move UR3 to place chicken (opposite of beef)
+    # -------------------------
+    print("\n[UR3] Moving to place chicken...")
+    
+    # Define target position (opposite of beef placement)
+    target_chicken_x = -chicken_x - 0.2
+    target_chicken_y = chicken_y
+    target_chicken_z = chicken_z + 0.05
+    
+    T_target_chicken = SE3(target_chicken_x, target_chicken_y, target_chicken_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for chicken target position
+    q_current = ur3.q.copy()
+    sol_target_chicken = ur3.ikine_LM(T_target_chicken, q0=q_current)
+    q_target_chicken = sol_target_chicken.q
+    
+    # Generate trajectory
+    if interpolation == 1:
+        q_matrix_move_chicken = rtb.jtraj(q_current, q_target_chicken, steps).q
+    elif interpolation == 2:
+        s_move_chicken = trapezoidal(0, 1, steps).q
+        q_matrix_move_chicken = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_move_chicken[i, :] = (1 - s_move_chicken[i]) * q_current + s_move_chicken[i] * q_target_chicken
+    
+    # Animate trajectory with chicken following
+    for i, q in enumerate(q_matrix_move_chicken):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # Update chicken position to follow end-effector with offset
+        T_ee = ur3.fkine(ur3.q)
+        chicken.T = T_ee @ T_offset_chicken
+        
+        # Beef stays at its final position
+        beef.T = T_beef_final
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Chicken placement complete!")
+    
+    # -------------------------
+    # Release chicken at target position
+    # -------------------------
+    print("\n[UR3] Releasing chicken...")
+    
+    # Store the final chicken position and flip it upright
+    T_chicken_final = chicken.T @ SE3.Rx(math.pi).A  # Flip 180 degrees around X to make upright
+    
+    # -------------------------
+    # UR3 Movement to Pepper (directly from chicken placement)
+    # -------------------------
+    print("\n[UR3] Moving to pepper...")
+    
+    # Get pepper position
+    pepper_x, pepper_y = POSITIONS["PEPPER"]
+    pepper_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    
+    # Define end-effector pose for pepper
+    T_pepper = SE3(pepper_x, pepper_y, pepper_z) @ SE3.Rx(math.pi)
+    
+    # Get current joint configuration
+    q_current = ur3.q.copy()
+    
+    # Solve inverse kinematics for pepper position
+    print("[UR3] Calculating inverse kinematics for pepper position...")
+    sol = ur3.ikine_LM(T_pepper, q0=q_current)
+    q_pepper = sol.q
+    
+    # Check if solution is valid and within joint limits
+    q_pepper_in_limits = not ur3.islimit(q_pepper)
+    print(f"q_pepper within joint limits: {q_pepper_in_limits}")
+    if not q_pepper_in_limits:
+        print(f"Warning: q_pepper may be outside limits: {q_pepper}")
+    
+    # Generate trajectory to pepper
+    if interpolation == 1:
+        q_matrix = rtb.jtraj(q_current, q_pepper, steps).q
+    elif interpolation == 2:
+        s = trapezoidal(0, 1, steps).q
+        q_matrix = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_pepper
+    
+    # Animate the trajectory to pepper
+    for i, q in enumerate(q_matrix):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Reached pepper position!")
+    print("[UR3] Pepper is now attached to end-effector")
+    
+    # -------------------------
+    # Attach pepper to UR3 end-effector with offset
+    # -------------------------
+    # Define offset for pepper relative to end-effector (in meters)
+    PEPPER_OFFSET_X = -0.3
+    PEPPER_OFFSET_Y = -0.09
+    PEPPER_OFFSET_Z = 0
+    
+    # Create offset transformation for pepper
+    T_offset_pepper = SE3(PEPPER_OFFSET_X, PEPPER_OFFSET_Y, PEPPER_OFFSET_Z)
+    
+    # Attach pepper to end-effector
+    T_ee = ur3.fkine(ur3.q)
+    pepper_grinder.T = T_ee @ T_offset_pepper
+    env.step(DT)
+    time.sleep(0.5)
+    
+    # -------------------------
+    # Move UR3 to place pepper (opposite placement)
+    # -------------------------
+    print("\n[UR3] Moving to place pepper...")
+    
+    # Define target position (opposite of pepper placement)
+    target_pepper_x = -pepper_x - 0.2
+    target_pepper_y = pepper_y
+    target_pepper_z = pepper_z + 0.05
+    
+    T_target_pepper = SE3(target_pepper_x, target_pepper_y, target_pepper_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for pepper target position
+    q_current = ur3.q.copy()
+    sol_target_pepper = ur3.ikine_LM(T_target_pepper, q0=q_current)
+    q_target_pepper = sol_target_pepper.q
+    
+    # Generate trajectory
+    if interpolation == 1:
+        q_matrix_move_pepper = rtb.jtraj(q_current, q_target_pepper, steps).q
+    elif interpolation == 2:
+        s_move_pepper = trapezoidal(0, 1, steps).q
+        q_matrix_move_pepper = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_move_pepper[i, :] = (1 - s_move_pepper[i]) * q_current + s_move_pepper[i] * q_target_pepper
+    
+    # Animate trajectory with pepper following
+    for i, q in enumerate(q_matrix_move_pepper):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # Update pepper position to follow end-effector with offset
+        T_ee = ur3.fkine(ur3.q)
+        pepper_grinder.T = T_ee @ T_offset_pepper
+        
+        # Beef and chicken stay at their final positions
+        beef.T = T_beef_final
+        chicken.T = T_chicken_final
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Pepper placement complete!")
+    
+    # -------------------------
+    # Release pepper at target position
+    # -------------------------
+    print("\n[UR3] Releasing pepper...")
+    
+    # Store the final pepper position and flip it upright
+    T_pepper_final = pepper_grinder.T @ SE3.Rx(math.pi).A  # Flip 180 degrees around X to make upright
+    
+    # -------------------------
+    # UR3 Movement to Jug (directly from pepper placement)
+    # -------------------------
+    print("\n[UR3] Moving to jug...")
+    
+    # Get jug position
+    jug_x, jug_y = POSITIONS["JUG"]
+    jug_z = TABLE_HEIGHT + 0.15  # Approach from above (15cm above table)
+    
+    # Define end-effector pose for jug
+    T_jug = SE3(jug_x, jug_y, jug_z) @ SE3.Rx(math.pi)
+    
+    # Get current joint configuration
+    q_current = ur3.q.copy()
+    
+    # Solve inverse kinematics for jug position
+    print("[UR3] Calculating inverse kinematics for jug position...")
+    sol = ur3.ikine_LM(T_jug, q0=q_current)
+    q_jug = sol.q
+    
+    # Check if solution is valid and within joint limits
+    q_jug_in_limits = not ur3.islimit(q_jug)
+    print(f"q_jug within joint limits: {q_jug_in_limits}")
+    if not q_jug_in_limits:
+        print(f"Warning: q_jug may be outside limits: {q_jug}")
+    
+    # Generate trajectory to jug
+    if interpolation == 1:
+        q_matrix = rtb.jtraj(q_current, q_jug, steps).q
+    elif interpolation == 2:
+        s = trapezoidal(0, 1, steps).q
+        q_matrix = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix[i, :] = (1 - s[i]) * q_current + s[i] * q_jug
+    
+    # Animate the trajectory to jug
+    for i, q in enumerate(q_matrix):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Reached jug position!")
+    print("[UR3] Jug is now attached to end-effector")
+    
+    # -------------------------
+    # Attach jug to UR3 end-effector with offset
+    # -------------------------
+    # Define offset for jug relative to end-effector (in meters)
+    JUG_OFFSET_X = -0.3
+    JUG_OFFSET_Y = -0.09
+    JUG_OFFSET_Z = 0
+    
+    # Create offset transformation for jug
+    T_offset_jug = SE3(JUG_OFFSET_X, JUG_OFFSET_Y, JUG_OFFSET_Z)
+    
+    # Attach jug to end-effector
+    T_ee = ur3.fkine(ur3.q)
+    jug.T = T_ee @ T_offset_jug
+    env.step(DT)
+    time.sleep(0.5)
+    
+    # -------------------------
+    # Move UR3 to place jug (opposite placement)
+    # -------------------------
+    print("\n[UR3] Moving to place jug...")
+    
+    # Define target position (opposite of jug placement)
+    target_jug_x = -jug_x - 0.2
+    target_jug_y = jug_y
+    target_jug_z = jug_z + 0.05
+    
+    T_target_jug = SE3(target_jug_x, target_jug_y, target_jug_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for jug target position
+    q_current = ur3.q.copy()
+    sol_target_jug = ur3.ikine_LM(T_target_jug, q0=q_current)
+    q_target_jug = sol_target_jug.q
+    
+    # Generate trajectory
+    if interpolation == 1:
+        q_matrix_move_jug = rtb.jtraj(q_current, q_target_jug, steps).q
+    elif interpolation == 2:
+        s_move_jug = trapezoidal(0, 1, steps).q
+        q_matrix_move_jug = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_move_jug[i, :] = (1 - s_move_jug[i]) * q_current + s_move_jug[i] * q_target_jug
+    
+    # Animate trajectory with jug following
+    for i, q in enumerate(q_matrix_move_jug):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # Update jug position to follow end-effector with offset
+        T_ee = ur3.fkine(ur3.q)
+        jug.T = T_ee @ T_offset_jug
+        
+        # Beef, chicken, and pepper stay at their final positions
+        beef.T = T_beef_final
+        chicken.T = T_chicken_final
+        pepper_grinder.T = T_pepper_final
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] Jug placement complete!")
+    
+    # -------------------------
+    # Release jug and move UR3 to final neutral position
+    # -------------------------
+    print("\n[UR3] Releasing jug and returning to neutral position...")
+    
+    # Store the final jug position and flip it upright
+    T_jug_final = jug.T @ SE3.Rx(math.pi).A  # Flip 180 degrees around X to make upright
+    
+    # Define final retreat position
+    retreat_x = 0.0
+    retreat_y = -0.5
+    retreat_z = jug_z + 0.3
+    
+    T_retreat_final = SE3(retreat_x, retreat_y, retreat_z) @ SE3.Rx(math.pi)
+    
+    # Solve IK for final retreat
+    q_current = ur3.q.copy()
+    sol_retreat_final = ur3.ikine_LM(T_retreat_final, q0=q_current)
+    q_retreat_final = sol_retreat_final.q
+    
+    # Generate trajectory for final retreat
+    if interpolation == 1:
+        q_matrix_retreat_final = rtb.jtraj(q_current, q_retreat_final, steps).q
+    elif interpolation == 2:
+        s_retreat_final = trapezoidal(0, 1, steps).q
+        q_matrix_retreat_final = np.empty((steps, ur3.n))
+        for i in range(steps):
+            q_matrix_retreat_final[i, :] = (1 - s_retreat_final[i]) * q_current + s_retreat_final[i] * q_retreat_final
+    
+    # Animate final retreat - all objects stay in place
+    for i, q in enumerate(q_matrix_retreat_final):
+        safety.block_until_allowed(env, DT)
+        ur3.q = q
+        
+        # All objects stay at their final positions
+        beef.T = T_beef_final
+        chicken.T = T_chicken_final
+        pepper_grinder.T = T_pepper_final
+        jug.T = T_jug_final
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[UR3] All tasks complete - beef, chicken, pepper, and jug placed!")
+    
+    # -------------------------
+    # CR3 Movement to Beef
+    # -------------------------
+    print("\n[CR3] Starting pick-and-place sequence...")
+    print("[CR3] Moving to beef...")
+    
+    # Get beef final position (where UR3 placed it)
+    beef_pickup_x = -beef_x - 0.2
+    beef_pickup_y = beef_y
+    beef_pickup_z = beef_z + 0.05 + 0.15  # Add extra height for approach
+    
+    # Define end-effector pose for beef pickup
+    T_beef_pickup = SE3(beef_pickup_x, beef_pickup_y, beef_pickup_z) @ SE3.Rx(math.pi)
+    
+    # Get current CR3 joint configuration
+    q_current_cr3 = cr3.q.copy()
+    
+    # Solve inverse kinematics for beef pickup position
+    print("[CR3] Calculating IK for beef pickup...")
+    sol_cr3 = cr3.ikine_LM(T_beef_pickup, q0=q_current_cr3)
+    q_beef_pickup = sol_cr3.q
+    
+    # Generate trajectory to beef
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_beef_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_beef_pickup
+    
+    # Animate trajectory to beef
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Reached beef position!")
+    
+    # Attach beef to CR3 with offset
+    CR3_OFFSET_X = 0.0
+    CR3_OFFSET_Y = 0.0
+    CR3_OFFSET_Z = -0.05
+    T_offset_cr3 = SE3(CR3_OFFSET_X, CR3_OFFSET_Y, CR3_OFFSET_Z)
+    
+    # Get pot position for placement
+    pot_x, pot_y = POSITIONS["POT"]
+    pot_z = TABLE_HEIGHT + 0.2  # Above the pot
+    
+    # Move beef to pot
+    print("[CR3] Moving beef to pot...")
+    T_pot = SE3(pot_x, pot_y, pot_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    # Generate trajectory to pot
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    # Animate trajectory with beef following
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        
+        # Update beef to follow CR3
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        beef.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A  # Keep upright
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Beef placed in pot!")
+    # Release beef in pot
+    beef.T = SE3(pot_x, pot_y, pot_z - 0.1).A  # Drop into pot
+    
+    # -------------------------
+    # CR3 Movement to Chicken
+    # -------------------------
+    print("[CR3] Moving to chicken...")
+    
+    chicken_pickup_x = -chicken_x - 0.2
+    chicken_pickup_y = chicken_y
+    chicken_pickup_z = chicken_z + 0.05 + 0.15
+    
+    T_chicken_pickup = SE3(chicken_pickup_x, chicken_pickup_y, chicken_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_chicken = cr3.ikine_LM(T_chicken_pickup, q0=q_current_cr3)
+    q_chicken_pickup = sol_chicken.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_chicken_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_chicken_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving chicken to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        chicken.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Chicken placed in pot!")
+    chicken.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    # -------------------------
+    # CR3 Movement to Pepper
+    # -------------------------
+    print("[CR3] Moving to pepper...")
+    
+    pepper_pickup_x = -pepper_x - 0.2
+    pepper_pickup_y = pepper_y
+    pepper_pickup_z = pepper_z + 0.05 + 0.15
+    
+    T_pepper_pickup = SE3(pepper_pickup_x, pepper_pickup_y, pepper_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pepper = cr3.ikine_LM(T_pepper_pickup, q0=q_current_cr3)
+    q_pepper_pickup = sol_pepper.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_pepper_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_pepper_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving pepper to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        pepper_grinder.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Pepper placed in pot!")
+    pepper_grinder.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    # -------------------------
+    # CR3 Movement to Jug
+    # -------------------------
+    print("[CR3] Moving to jug...")
+    
+    jug_pickup_x = -jug_x - 0.2
+    jug_pickup_y = jug_y
+    jug_pickup_z = jug_z + 0.05 + 0.15
+    
+    T_jug_pickup = SE3(jug_pickup_x, jug_pickup_y, jug_pickup_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_jug = cr3.ikine_LM(T_jug_pickup, q0=q_current_cr3)
+    q_jug_pickup = sol_jug.q
+    
+    if interpolation == 1:
+        q_matrix_cr3 = rtb.jtraj(q_current_cr3, q_jug_pickup, steps).q
+    elif interpolation == 2:
+        s_cr3 = trapezoidal(0, 1, steps).q
+        q_matrix_cr3 = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_cr3[i, :] = (1 - s_cr3[i]) * q_current_cr3 + s_cr3[i] * q_jug_pickup
+    
+    for i, q in enumerate(q_matrix_cr3):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Moving jug to pot...")
+    
+    q_current_cr3 = cr3.q.copy()
+    sol_pot = cr3.ikine_LM(T_pot, q0=q_current_cr3)
+    q_pot = sol_pot.q
+    
+    if interpolation == 1:
+        q_matrix_to_pot = rtb.jtraj(q_current_cr3, q_pot, steps).q
+    elif interpolation == 2:
+        s_pot = trapezoidal(0, 1, steps).q
+        q_matrix_to_pot = np.empty((steps, cr3.n))
+        for i in range(steps):
+            q_matrix_to_pot[i, :] = (1 - s_pot[i]) * q_current_cr3 + s_pot[i] * q_pot
+    
+    for i, q in enumerate(q_matrix_to_pot):
+        safety.block_until_allowed(env, DT)
+        cr3.q = q
+        T_ee_cr3 = cr3.fkine(cr3.q)
+        jug.T = (T_ee_cr3 @ T_offset_cr3 @ SE3.Rx(math.pi)).A
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR3] Jug placed in pot!")
+    jug.T = SE3(pot_x, pot_y, pot_z - 0.1).A
+    
+    print("[CR3] All ingredients placed in pot - cooking complete!")
+    
+    # -------------------------
+    # CR16 Movement to Pot
+    # -------------------------
+    print("\n[CR16] Starting pot transfer to stove...")
+    print("[CR16] Moving to pot...")
+    
+    # Get pot position
+    pot_x, pot_y = POSITIONS["POT"]
+    pot_z = TABLE_HEIGHT + 0.2  # Approach from above
+    
+    # Define end-effector pose for pot pickup
+    T_pot_pickup = SE3(pot_x, pot_y, pot_z) @ SE3.Rx(math.pi)
+    
+    # Get current CR16 joint configuration
+    q_current_cr16 = cr16.q.copy()
+    
+    # Solve inverse kinematics for pot pickup position
+    print("[CR16] Calculating IK for pot pickup...")
+    sol_cr16 = cr16.ikine_LM(T_pot_pickup, q0=q_current_cr16)
+    q_pot_pickup = sol_cr16.q
+    
+    # Generate trajectory to pot
+    if interpolation == 1:
+        q_matrix_cr16 = rtb.jtraj(q_current_cr16, q_pot_pickup, steps).q
+    elif interpolation == 2:
+        s_cr16 = trapezoidal(0, 1, steps).q
+        q_matrix_cr16 = np.empty((steps, cr16.n))
+        for i in range(steps):
+            q_matrix_cr16[i, :] = (1 - s_cr16[i]) * q_current_cr16 + s_cr16[i] * q_pot_pickup
+    
+    # Animate trajectory to pot
+    for i, q in enumerate(q_matrix_cr16):
+        safety.block_until_allowed(env, DT)
+        cr16.q = q
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR16] Reached pot position!")
+    
+    # Attach pot to CR16 with offset
+    CR16_OFFSET_X = 0.0
+    CR16_OFFSET_Y = 0.0
+    CR16_OFFSET_Z = -0.05
+    T_offset_cr16 = SE3(CR16_OFFSET_X, CR16_OFFSET_Y, CR16_OFFSET_Z)
+    
+    # Get stove position for placement
+    stove_x, stove_y = POSITIONS["STOVE"]
+    stove_z = FLOOR_TOP + 0.9  # On top of the stove
+    
+    # Move pot to stove
+    print("[CR16] Moving pot to stove...")
+    T_stove = SE3(stove_x, stove_y, stove_z) @ SE3.Rx(math.pi)
+    
+    q_current_cr16 = cr16.q.copy()
+    sol_stove = cr16.ikine_LM(T_stove, q0=q_current_cr16)
+    q_stove = sol_stove.q
+    
+    # Generate trajectory to stove
+    if interpolation == 1:
+        q_matrix_to_stove = rtb.jtraj(q_current_cr16, q_stove, steps).q
+    elif interpolation == 2:
+        s_stove = trapezoidal(0, 1, steps).q
+        q_matrix_to_stove = np.empty((steps, cr16.n))
+        for i in range(steps):
+            q_matrix_to_stove[i, :] = (1 - s_stove[i]) * q_current_cr16 + s_stove[i] * q_stove
+    
+    # Animate trajectory with pot following
+    for i, q in enumerate(q_matrix_to_stove):
+        safety.block_until_allowed(env, DT)
+        cr16.q = q
+        
+        # Update pot to follow CR16
+        T_ee_cr16 = cr16.fkine(cr16.q)
+        pot.T = (T_ee_cr16 @ T_offset_cr16).A
+        
+        # All ingredients stay in the pot (move with it)
+        beef.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        chicken.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        pepper_grinder.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        jug.T = (T_ee_cr16 @ T_offset_cr16 @ SE3(0, 0, -0.1)).A
+        
+        env.step(DT)
+        time.sleep(DT)
+    
+    print("[CR16] Pot placed on stove!")
+    
+    # Release pot on stove with flip
+    pot.T = SE3(stove_x, stove_y, stove_z - 0.1)
+    beef.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
+    chicken.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
+    pepper_grinder.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
+    jug.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
+    
+    # Update scene to show the flip
+    env.step(DT)
+    time.sleep(DT)
+    
+    print("[CR16] Pot transfer complete - ready to cook!")
+
+    env.set_camera_pose([1.8, 3.4, 1.6], [0.0, -0.5, 0.8])
+    env.hold()
+
+
+if __name__ == "__main__":
+    main()
