@@ -1516,7 +1516,7 @@ def main():
     print("[CR16] Pot placed on stove!")
     
     # Release pot on stove with flip
-    pot.T = SE3(stove_x, stove_y, stove_z - 0.3)
+    pot.T = SE3(stove_x, stove_y, stove_z - 0.28)
     beef.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
     chicken.T = (SE3(stove_x, stove_y, stove_z - 0.15) @ SE3.Rx(math.pi)).A
 
