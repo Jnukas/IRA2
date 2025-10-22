@@ -128,6 +128,49 @@ RUN_WIGGLE_CR16 = True
 RUN_RAIL_SLIDE  = True
 FPS = 60
 DT = 1.0 / FPS
+# ========================= hardware
+import serial  # pip install pyserial
+# ... (code above)
+
+def start_arduino_estop_listener(safety, port="COM3", baud=115200, verbose=True):
+    """
+    Listen for lines like 'E,1' from the Arduino.
+    On 'E,1' -> engage_e_stop() (latched). 'E,0' is ignored (resume via GUI).
+    """
+    def _worker():
+        try:
+            ser = serial.Serial(port, baudrate=baud, timeout=0.05)
+            # Uno resets on serial open; give it time to boot
+            time.sleep(2.0)
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            print(f"[E-STOP] Listening on {port} @ {baud}")
+        except Exception as e:
+            print(f"[E-STOP] Serial open failed ({port}): {e}")
+            return
+
+        while True:
+            try:
+                line = ser.readline().decode(errors="ignore").strip()
+                if not line:
+                    continue
+                if verbose:
+                    print(f"[E-STOP] RX: {line}")
+                if line.startswith("E,"):
+                    parts = line.split(",", 1)
+                    if len(parts) == 2 and parts[1].strip() == "1":
+                        if not safety.e_stop_engaged:
+                            print("🔴 [E-STOP] Arduino button pressed → E-STOP engaged")
+                        safety.engage_e_stop()
+            except Exception as e:
+                print(f"[E-STOP] Listener error: {e}")
+                break
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return t
 
 # ===== Safety Controller (unchanged) =====
 class SafetyController:
@@ -357,7 +400,7 @@ def main():
 
     safety = SafetyController()
     threading.Thread(target=launch_safety_gui, args=(safety,), daemon=True).start()
-
+    start_arduino_estop_listener(safety, port="COM9", baud=115200)  # change COM port if needed
     # -------------------------
     # Room Constants
     # -------------------------
