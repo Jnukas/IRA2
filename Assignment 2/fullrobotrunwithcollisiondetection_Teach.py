@@ -87,8 +87,8 @@ SCALES = {
 POSITIONS = {
     # Format: "NAME": (x = red, y = green -closer to back wall) 
     "STOVE": (0.0, -2.4),           # Back wall
-    "TABLE1": (-1.3, -2.5),         # First table
-    "TABLE2": (1.3, 0.5),          # Work table (second table = grocery table)
+    "TABLE1": (-0.80, -0.75),         # First table
+    "TABLE2": (0.80, -0.75),          # Work table (second table = grocery table)
     "POT": (-1.15, -1),           # On table 1
     "JUG": (0.4, -1.3),             # On table 2 (1.50 - 0.3)
     "PEPPER": (0.35, -0.7),         # On table 2 (1.50 - 0.3)
