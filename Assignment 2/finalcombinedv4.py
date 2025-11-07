@@ -28,6 +28,8 @@ from spatialmath import UnitQuaternion
 # asset helpers
 import trimesh
 from itertools import combinations
+import numpy as _np
+
 
 
 # Room Constants
@@ -37,25 +39,6 @@ FLOOR_TOP = 0.005
 TABLE1_HEIGHT = 0.32 
 TABLE2_HEIGHT = 0.32
 
-
-def _np(v):
-    import numpy as _np
-    return _np.array(v, dtype=float)
-
-def mesh_bounds_info(path: Path, scale_vec):
-
-    tm = trimesh.load_mesh(str(path), process=False)
-
-    bmin = np.asarray(tm.bounds[0], dtype=float)
-    bmax = np.asarray(tm.bounds[1], dtype=float)
-
-    sv = np.asarray(scale_vec, dtype=float)
-    if sv.size == 1:
-        sv = np.repeat(float(sv), 3)
-    size_m = (bmax - bmin) * sv
-    z_lift = -bmin[2] * sv[2]
-
-    return float(z_lift), size_m
 
 # Scales
 SCALES = {
