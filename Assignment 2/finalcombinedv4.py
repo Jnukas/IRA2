@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 import math
 import time
-import importlib.util
-import inspect
 import threading
 import tkinter as tk
 
@@ -26,10 +24,7 @@ from spatialmath.base import tr2rpy
 from spatialmath import UnitQuaternion
 
 # asset helpers
-import trimesh
 from itertools import combinations
-import numpy as _np
-
 
 
 # Room Constants
@@ -92,7 +87,7 @@ HEIGHT_OFFSETS = {
 
 
 
-# Movement speed
+# referesh rate
 DT = 0.015
 
 # hardware
@@ -457,7 +452,7 @@ def animate_robot_movement(robot, q_matrix, safety, env, obstacles_list=None, ro
         
         if obstacles_list is not None:
             if check_collision(robot, q, obstacles_list, robot_name=robot_name):
-                pass  # Collision message already printed
+                pass  
         
         robot.q = q
         env.step(DT)
@@ -735,7 +730,7 @@ def main():
     
     # ROBOT MOVEMENTS
     
-    # UR3 Movement to Beef (on TABLE2)
+    # UR3 Movement to Beef
     beef_x, beef_y = POSITIONS["BEEF"]
     beef_z = TABLE2_HEIGHT + 0.15  
     T_beef = SE3(beef_x, beef_y, beef_z) @ SE3.Rx(math.pi)
