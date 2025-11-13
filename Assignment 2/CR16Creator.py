@@ -53,19 +53,7 @@ class CR16(DHRobot3D):
         self.q = qtest
 
     # -----------------------------------------------------------------------------------#
-    def _create_DH(self):
-        """
-        Create robot's standard DH model
-        """
-        a = [0,      -0.512, -0.363, 0,       0, 0]
-        d = [0.1785, 0,         0,       0.191, 0.125, 0.1084]
-        alpha = [pi/2, 0.0,    0.0,    pi/2, -pi/2, 0]
-        qlim = [[-2*pi, 2*pi] for _ in range(6)]
-        links = []
-        for i in range(6):
-            link = rtb.RevoluteDH(d=d[i], a=a[i], alpha=alpha[i], qlim= qlim[i])
-            links.append(link)
-        return links
+  
 
     # -----------------------------------------------------------------------------------#
     def test(self):

@@ -90,6 +90,7 @@ HEIGHT_OFFSETS = {
 # referesh rate
 DT = 0.015
 
+#Arduinoi e-stop
 # hardware
 import serial
 
@@ -128,7 +129,7 @@ def start_arduino_estop_listener(safety, port="COM3", baud=115200):
     t.start()
     return t
 
-# Safety Controller
+# Safety Controller enforces the e-stop across all motion loops
 class SafetyController:
     def __init__(self):
         self._lock = threading.Lock()
@@ -204,6 +205,7 @@ def launch_safety_gui(safety: SafetyController):
     refresh_label()
     root.mainloop()
 
+#line place intersection
 def is_intersection_point_inside_triangle(intersect_p, triangle_verts):
     u = triangle_verts[1, :] - triangle_verts[0, :]
     v = triangle_verts[2, :] - triangle_verts[0, :]
@@ -230,7 +232,6 @@ def is_intersection_point_inside_triangle(intersect_p, triangle_verts):
         return False
 
     return True
-
 
 def get_link_points(robot, q=None):
     if q is None:
@@ -284,6 +285,7 @@ def check_collision(robot, q, obstacles_list, env=None, visualize=False, robot_n
     return False
 
 
+#GUI
 def teach_multi_swift(robots: dict, env, safety, default="CR16", dt=0.02):
     active = {"name": default if default in robots else next(iter(robots.keys()))}
 
@@ -435,14 +437,24 @@ def teach_multi_swift(robots: dict, env, safety, default="CR16", dt=0.02):
     threading.Thread(target=_label_refresher, daemon=True).start()
     refresh_labels()
 
+#Jacobian
+def warn_if_singular(robot, q, robot_name, tol=1e-3):
+        J = robot.jacob0(q)
+        Jpos = J[:3, :]                  # translational part
+        manip = np.sqrt(np.linalg.det(Jpos @ Jpos.T))
+        if manip < tol:
+            print(f"[{robot_name}] Jacobian near-singular (manip={manip:.2e})")
+
 
 #  Movement FUNCTIONS
 
 def compute_ik_trajectory(robot, T_target, q_current, steps, robot_name="Robot"):
       
     sol = robot.ikine_LM(T_target, q0=q_current)
+    #Solve inverse kinematics numerically to reach T_target, 
+    #starting the search from my current joint angles
     q_target = sol.q
-    q_matrix = rtb.jtraj(q_current, q_target, steps).q
+    q_matrix = rtb.jtraj(q_current, q_target, steps).q 
     return q_matrix
 
 
@@ -455,6 +467,15 @@ def animate_robot_movement(robot, q_matrix, safety, env, obstacles_list=None, ro
                 pass  
         
         robot.q = q
+        warn_if_singular(robot, robot.q, robot_name)
+
+        #singularity check
+        J = robot.jacob0(robot.q)
+        trans_jac = J[:3, :]  # translational part
+        w = np.sqrt(np.linalg.det(trans_jac @ trans_jac.T))
+        if w < 1e-3:
+            print(f"[{robot_name}] Near singularity (manipulability={w:.2e}) at step {i}")
+        
         env.step(DT)
         time.sleep(DT)
 
@@ -484,6 +505,7 @@ def animate_robot_with_multiple_objects(robot, q_matrix, objects_with_offsets, s
         env.step(DT)
         time.sleep(DT)
 
+#how the code works
 def main():
     apply_swift_browser_fix()
     env = swift.Swift()
