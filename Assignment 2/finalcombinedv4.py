@@ -457,6 +457,37 @@ def compute_ik_trajectory(robot, T_target, q_current, steps, robot_name="Robot")
     q_matrix = rtb.jtraj(q_current, q_target, steps).q 
     return q_matrix
 
+#RMRC_trail
+def rmrc_follow_path(robot, poses, safety, env, robot_name="Robot", dt=DT, gain=1.0):
+    """
+    Resolved-motion-rate control: follow a list of SE3 targets by
+    incrementally adjusting joints using the Jacobian pseudoinverse.
+    """
+    q = robot.q.copy()
+
+    for step, T_goal in enumerate(poses):
+        safety.block_until_allowed(env, dt)
+
+        # Current pose
+        T_now = robot.fkine(q)
+        p_err = T_goal.t - T_now.t                       # 3D position error
+        R_err = T_now.R.T @ T_goal.R
+        rotvec = rtb.AngleAxis(R_err).v                  # minimal orientation error
+
+        # Desired spatial velocity (stack translation + rotation)
+        v = np.hstack((gain * p_err, gain * rotvec))
+
+        # Jacobian and damped pseudoinverse
+        J = robot.jacob0(q)
+        lam = 1e-3
+        J_pinv = J.T @ np.linalg.inv(J @ J.T + lam * np.eye(6))
+
+        dq = J_pinv @ v
+        q = q + dq * dt
+
+        robot.q = q
+        env.step(dt)
+        time.sleep(dt)
 
 def animate_robot_movement(robot, q_matrix, safety, env, obstacles_list=None, robot_name="Robot"):
     for i, q in enumerate(q_matrix):
@@ -837,6 +868,7 @@ def main():
     
     q_matrix = compute_ik_trajectory(ur3, T_pepper, q_current, steps, "UR3")
     animate_robot_movement(ur3, q_matrix, safety, env, obstacles_list, "UR3")
+    
     
     
     # Attach pepper
