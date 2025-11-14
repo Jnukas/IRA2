@@ -1,3 +1,8 @@
+##  @file
+#   @brief UR3 Robot defined by standard DH parameters with 3D model
+#   @author Ho Minh Quang Ngo
+#   @date Jul 20, 2023
+
 import swift
 import roboticstoolbox as rtb
 import spatialmath.base as spb
@@ -35,13 +40,13 @@ class CR16(DHRobot3D):
         links = self._create_DH()
 
         # Names of the robot link files in the directory
-        link3D_names = dict(link0 = 'CR16_link_1',
-                            link1 = 'CR16_link_2',
-                            link2 = 'CR16_link_3',
-                            link3 = 'CR16_link_4',
-                            link4 = 'CR16_link_5',
-                            link5 = 'CR16_link_6',
-                            link6 = 'CR16_link_7')
+        link3D_names = dict(link0 = 'CR16Smaller_1',
+                            link1 = 'CR16Smaller_2',
+                            link2 = 'CR16Smaller_3',
+                            link3 = 'CR16Smaller_4',
+                            link4 = 'CR16Smaller_5',
+                            link5 = 'CR16Smaller_6',
+                            link6 = 'CR16Smaller_7')
 
         # A joint config and the 3D object transforms to match that config
         qtest = [0,-pi/2,0,0,0,0]
@@ -53,7 +58,19 @@ class CR16(DHRobot3D):
         self.q = qtest
 
     # -----------------------------------------------------------------------------------#
-  
+    def _create_DH(self):
+        """
+        Create robot's standard DH model
+        """
+        a = [0,      -0.512, -0.363, 0,       0, 0]
+        d = [0.1785, 0,         0,       0.191, 0.125, 0.1084]
+        alpha = [pi/2, 0, 0, pi/2, -pi/2, 0]
+        qlim = [[-2*pi, 2*pi] for _ in range(6)]
+        links = []
+        for i in range(6):
+            link = rtb.RevoluteDH(d=d[i], a=a[i], alpha=alpha[i], qlim= qlim[i])
+            links.append(link)
+        return links
 
     # -----------------------------------------------------------------------------------#
     def test(self):
@@ -74,7 +91,7 @@ class CR16(DHRobot3D):
             env.step(0.02)
             # fig.step(0.01)
         time.sleep(3)
-        env.hold()
+        # env.hold()
 
 # ---------------------------------------------------------------------------------------#
 if __name__ == "__main__":
