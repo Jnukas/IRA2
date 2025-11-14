@@ -523,6 +523,38 @@ def teach_multi_swift(robots: dict, env, safety, default="CR16", dt=0.02):
 
 # ===== HELPER FUNCTIONS TO CONSOLIDATE REPETITIVE CODE =====
 
+#RMRC_trial
+def rmrc_follow_path(robot, poses, safety, env, robot_name="Robot", dt=DT, gain=1.0):
+    """
+    Resolved-motion-rate control: follow a list of SE3 targets by
+    incrementally adjusting joints using the Jacobian pseudoinverse.
+    """
+    q = robot.q.copy()
+
+    for step, T_goal in enumerate(poses):
+        safety.block_until_allowed(env, dt)
+
+        # Current pose
+        T_now = robot.fkine(q)
+        p_err = T_goal.t - T_now.t                       # 3D position error
+        R_err = T_now.R.T @ T_goal.R
+        rotvec = rtb.AngleAxis(R_err).v                  # minimal orientation error
+
+        # Desired spatial velocity (stack translation + rotation)
+        v = np.hstack((gain * p_err, gain * rotvec))
+
+        # Jacobian and damped pseudoinverse
+        J = robot.jacob0(q)
+        lam = 1e-3
+        J_pinv = J.T @ np.linalg.inv(J @ J.T + lam * np.eye(6))
+
+        dq = J_pinv @ v
+        q = q + dq * dt
+
+        robot.q = q
+        env.step(dt)
+        time.sleep(dt)
+
 def compute_ik_trajectory(robot, T_target, q_current, interpolation, steps, robot_name="Robot"):
     """
     Compute IK and generate trajectory. Prints warning if out of limits but proceeds anyway.
